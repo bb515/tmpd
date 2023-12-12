@@ -71,13 +71,15 @@ def plot_marginals(x_lims, ou_dist, sde):
     figure_sizes = {'fullwidth': 10}
     # Grid spec
     fig = plt.figure(figsize=(figure_sizes['fullwidth'], 0.4*figure_sizes['fullwidth']))
-    gs = GridSpec(1, 3, width_ratios=[1, 3.3, 1])
+    gs = GridSpec(2, 3, width_ratios=[1, 3.3, 1], height_ratios=[1, 1])
     gs.update(left=0.075,
           right=0.92,
           top=0.8,
           bottom=0.2,
           wspace=0.2,hspace=0.08)
-    axs = np.array([fig.add_subplot(gs[:, i]) for i in range(3)])
+    axs = np.array([fig.add_subplot(gs[0, i]) for i in range(3)] + [fig.add_subplot(gs[1, :])])
+
+    # ax = fig.add_subplot(gs[1, :])
     vmax = np.max(vals)
     vmin = np.min(vals)
 
@@ -106,20 +108,23 @@ def plot_marginals(x_lims, ou_dist, sde):
     bbox1 = axs[1].get_position()
     bbox2 = axs[2].get_position()
 
-    im_ratio = 0.67
-    axs[0].set_position([bbox1.x0 - 3. * bbox0.width, bbox0.y0 + bbox1.height * (1 - im_ratio) / 2, bbox0.width, bbox1.height * (im_ratio)])
+    # im_ratio = 0.67
+    im_ratio = 1.0
+    width = 1.29
+    axs[0].set_position([bbox1.x0 - 1.74 * width * bbox0.width, bbox0.y0 + bbox1.height * (1 - im_ratio) / 2, bbox0.width, bbox1.height * (im_ratio)])
     axs[1].set_aspect(0.33/(x_lims[1] - x_lims[0]))
-    axs[2].set_position([bbox1.x0 + 2. * bbox0.width, bbox2.y0 + bbox1.height * (1 - im_ratio) / 2, bbox2.width, bbox1.height * (im_ratio)])
+    axs[2].set_position([bbox1.x0 + width * bbox0.width, bbox2.y0 + bbox1.height * (1 - im_ratio) / 2, bbox2.width, bbox1.height * (im_ratio)])
 
-    # axs[0].set_position([bbox0.x0, bbox0.y0, bbox0.width, bbox1.height])
-    # axs[0].set_position([bbox1.x0 - bbox1.width * (1 + 1e-3) / 3, bbox1.y0, bbox1.width / 6, bbox1.height])
-    # axs[1].set_position([bbox0.x1 + bbox0.width * (1 + (1e-3 / 3)), bbox1.y0, bbox1.width, bbox0.height])
-    # axs[1].set_position([bbox1.x0, bbox1.y0, bbox1.width, bbox0.height])
-    # axs[2].set_position([bbox2.x0 + bbox2.width * (1 + (1e-3 / 3)), bbox2.y0, bbox2.width, bbox2.height])
-    # axs[2].set_position([bbox2.x0, bbox2.y0, bbox2.width, bbox1.height])
+    bbox1 = axs[1].get_position()
+
+    # axs[3].axis('off')
+    # axs[3].set_frame_on(False)
+    axs[3].get_xaxis().set_visible(False)
+    axs[3].get_yaxis().set_visible(False)
+    axs[3].set_position([bbox1.x0, bbox1.y0 * (1. - 9./10), bbox1.height, bbox1.height])
 
     # fig.tight_layout()
-    return fig, axs
+    return fig, axs, bbox1
 
 
 def ot_sliced_wasserstein(seed, dist_1, dist_2, n_slices=100):
@@ -391,24 +396,23 @@ def main(argv):
                             config.solver.num_outer_steps, config.eval.batch_size, config.data.image_size)
                         frames = 100
                         x_lims = (-8., 8.)
-                        fig, axs = plot_marginals(x_lims, ou_mixt_jax_fun, sde)
+                        fig, axs, bbox1 = plot_marginals(x_lims, ou_mixt_jax_fun, sde)
                         fig.savefig("test.png")
                         axs[1].set_prop_cycle(new_prop_cycle)
                         axs[1].plot(ts[990].reshape(-1, 1), samples[990, 0, 0].reshape(-1, 1).T)
-                        def animate(i, ax):
-                            for art in list(ax.lines):
+                        def animate(i, axs):
+                            for art in list(axs[1].lines):
                                 art.remove()
                             idx = config.solver.num_outer_steps - int((i + 1) * config.solver.num_outer_steps / frames)
                             idxs = np.linspace(idx, int(config.solver.num_outer_steps * ( 1. - 1. / frames)), i + 1, dtype=int)
-                            # print(samples[idxs, 0, 0])
-                            ax.plot(ts[idxs], samples[idxs, :, 0], linewidth="0.5")
-                            # ax2.plot(x, -3*x**2)
-                            ax.annotate("",
-                                        xy=(0, 0), xycoords=ax.transData,
-                                        xytext=(0, 0.1), textcoords=ax.transData,
-                                        arrowprops=dict(arrowstyle="<->"))
+                            axs[1].plot(ts[idxs], samples[idxs, :, 0], linewidth="0.5")
+                            # axs[1].annotate("",
+                            #             xy=(0, 0), xycoords=axs[1].transData,
+                            #             xytext=(0, 0.1), textcoords=axs[1].transData,
+                            #             arrowprops=dict(arrowstyle="<->"))
+                            axs[3].set_position([bbox1.x0  + bbox1.width * (i / frames), bbox1.y0 * (1. - 9./10), bbox1.height, bbox1.height])
 
-                        plot_animation(fig, axs[1],
+                        plot_animation(fig, axs,
                                     animate, frames,
                                     fname="{}_{}_{}".format(config.sampling.noise_std, config.sampling.cs_method.lower(), i),
                                     bitrate=1000,
