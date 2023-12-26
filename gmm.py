@@ -16,7 +16,7 @@ from diffusionjax.plot import plot_heatmap
 from diffusionjax.utils import get_sampler
 from diffusionjax.run_lib import get_ddim_chain
 import diffusionjax.sde as sde_lib
-from tmpd.samplers import get_cs_sampler
+from tmpd.samplers import get_cs_sampler, get_stsl_sampler
 from tmpd.plot import plot_single_image, plot_image
 import numpy as np
 import logging
@@ -241,8 +241,8 @@ def main(argv):
                     y = y.flatten()
                     return H.T @ y
 
-                ddim_methods = ['PiGDMVP', 'PiGDMVE', 'DDIMVE', 'DDIMVP', 'KGDMVP', 'KGDMVE']
-                cs_methods = ['KPDDPM', 'KPDDPMdiag', 'DPSDDPM', 'PiGDMVP']
+                ddim_methods = ['PiGDMVP', 'PiGDMVE', 'DDIMVE', 'DDIMVP', 'KGDMVP', 'KGDMVE', 'STSL']
+                cs_methods = ['KPDDPM', 'KPDDPMdiag', 'DPSDDPM', 'PiGDMVP', 'STSL']
                 # cs_methods = ['TMPD2023avjp', 'TMPD2023bvjp', 'Chung2022scalar', 'Song2023']
 
                 for cs_method in cs_methods:

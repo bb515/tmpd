@@ -1,5 +1,5 @@
 """Samplers."""
-from diffusionjax.utils import get_sampler
+from diffusionjax.utils import get_sampler, shared_update
 from diffusionjax.inverse_problems import (
     get_dps,
     get_diffusion_posterior_sampling,
@@ -13,7 +13,7 @@ from diffusionjax.inverse_problems import (
     get_diag_jacfwd_guidance)
 from diffusionjax.solvers import EulerMaruyama
 from tmpd.solvers import (
-    MPGD,
+    STSL, MPGD,
     DPSDDPM, DPSDDPMplus,
     KPDDPM, KPSMLD,
     KPSMLDdiag, KPDDPMdiag,
@@ -21,6 +21,10 @@ from tmpd.solvers import (
     DPSSMLD, DPSSMLDplus,
     PiGDMVE, PiGDMVP, PiGDMVPplus, PiGDMVEplus,
     KGDMVE, KGDMVP, KGDMVEplus, KGDMVPplus)
+from functools import partial
+import jax.numpy as jnp
+from jax import random
+from jax.lax import scan
 
 
 def get_cs_sampler(config, sde, model, sampling_shape, inverse_scaler, y, H, observation_map, adjoint_observation_map, stack_samples=False):
@@ -132,6 +136,25 @@ def get_cs_sampler(config, sde, model, sampling_shape, inverse_scaler, y, H, obs
                             beta_min=config.model.beta_min,
                             beta_max=config.model.beta_max)
         sampler = get_sampler(sampling_shape, outer_solver, inverse_scaler=inverse_scaler, stack_samples=stack_samples, denoise=True)
+    elif config.sampling.cs_method.lower()=='stsl':
+      # Reproduce Second Order Tweedie sampler from Surrogate Loss (STSL) from (Rout et al. 2023)
+      # What contrastive loss do they use?
+        forward_solver = EulerMaruyama(sde)
+        outer_solver = STSL(config.solver.stsl_scale_hyperparameter,
+                            config.solver.dps_scale_hyperparameter, y,
+                            observation_map, adjoint_observation_map,
+                            config.sampling.noise_std, sampling_shape[1:],
+                            model, num_steps=config.solver.num_outer_steps,
+                            dt=config.solver.dt, epsilon=config.solver.epsilon,
+                            beta_min=config.model.beta_min,
+                            beta_max=config.model.beta_max)
+        # needs a special prior initialization that depends on the observed data, so uses different sampler
+        sampler = get_stsl_sampler(sampling_shape,
+                                   forward_solver,
+                                   outer_solver,
+                                   inverse_scaler=inverse_scaler,
+                                   stack_samples=stack_samples,
+                                   denoise=True)
     elif config.sampling.cs_method.lower()=='mpgd':
         # Reproduce MPGD (et al. 2023) paper for VP SDE
         outer_solver = MPGD(config.solver.mpgd_scale_hyperparameter, y, observation_map, config.sampling.noise_std, sampling_shape[1:], model, num_steps=config.solver.num_outer_steps,
@@ -266,3 +289,92 @@ def get_cs_sampler(config, sde, model, sampling_shape, inverse_scaler, y, H, obs
     else:
         raise ValueError("`config.sampling.cs_method` not recognized, got {}".format(config.sampling.cs_method))
     return sampler
+
+
+def get_stsl_sampler(shape,
+                     forward_solver,
+                     inner_solver,
+                     denoise=True,
+                     stack_samples=False,
+                     inverse_scaler=None):
+  """Get a sampler from (possibly interleaved) numerical solver(s).
+
+  Args:
+    shape: Shape of array, x. (num_samples,) + obj_shape, where x_shape is the shape
+      of the object being sampled from, for example, an image may have
+      obj_shape==(H, W, C), and so shape==(N, H, W, C) where N is the number of samples.
+    inner_solver: A valid numerical solver class that will act on an inner loop.
+    denoise: Bool, that if `True` applies one-step denoising to final samples.
+    stack_samples: Bool, that if `True` return all of the sample path or
+      just returns the last sample.
+    inverse_scaler: The inverse data normalizer function.
+  Returns:
+    A sampler.
+  """
+  if inverse_scaler is None: inverse_scaler = lambda x: x
+
+  def sampler(rng, x_0=None):
+    """
+    Args:
+      rng: A JAX random state.
+      x_0: Initial condition. If `None`, then samples an initial condition from the
+          sde's initial condition prior. Note that this initial condition represents
+          `x_T sim Normal(O, I)` in reverse-time diffusion.
+    Returns:
+        Samples and the number of score function (model) evaluations.
+    """
+    forward_update = partial(shared_update,
+                             solver=forward_solver)
+    outer_ts = inner_solver.ts
+
+    def forward_step(carry, t):
+      rng, x, x_mean = carry
+      vec_t = jnp.full((shape[0],), t)
+      rng, step_rng = random.split(rng)
+      x, x_mean = forward_update(step_rng, x, vec_t)
+      return (rng, x, x_mean), ()
+
+    inner_update = partial(shared_update,
+                            solver=inner_solver)
+    inner_ts = jnp.ones((3, 1))
+    num_function_evaluations = jnp.size(outer_ts) * (3 * jnp.size(inner_ts))
+
+    def inner_step(carry, t):
+      rng, x, x_mean, vec_t = carry
+      rng, step_rng = random.split(rng)
+      x, x_mean = inner_update(step_rng, x, vec_t)
+      return (rng, x, x_mean, vec_t), ()
+
+    def outer_step(carry, t):
+      rng, x, x_mean = carry
+      vec_t = jnp.full(shape[0], t)
+      rng, step_rng = random.split(rng)
+      # Use x_mean as input for first inner step
+      (rng, x, x_mean, vec_t), _ = scan(inner_step, (step_rng, x_mean, x_mean, vec_t), inner_ts)
+      if not stack_samples:
+        return (rng, x, x_mean), ()
+      else:
+        if denoise:
+          return (rng, x, x_mean), x_mean
+        else:
+          return (rng, x, x_mean), x
+
+    rng, step_rng = random.split(rng)
+    if x_0 is None:
+      x = inner_solver.prior(step_rng, shape)
+    else:
+      assert(x_0.shape==shape)
+      x = x_0
+
+    # get initial sample
+    x = inner_solver.batch_adjoint_observation_map(inner_solver.y)
+    (_, x, x_mean), _ = scan(forward_step, (rng, x, x), outer_ts, reverse=False)
+
+    if not stack_samples:
+      (_, x, x_mean), _ = scan(outer_step, (rng, x, x), outer_ts, reverse=True)
+      return inverse_scaler(x_mean if denoise else x), num_function_evaluations
+    else:
+      (_, _, _), xs = scan(outer_step, (rng, x, x), outer_ts, reverse=True)
+      return inverse_scaler(xs), num_function_evaluations
+  # return jax.pmap(sampler, in_axes=(0), axis_name='batch')
+  return sampler
