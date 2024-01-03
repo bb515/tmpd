@@ -32,8 +32,6 @@ BG_COLOUR = (239/255, 239/255, 239/255)
 BG_ALPHA = 1.0
 MG_ALPHA = 1.0
 FG_ALPHA = 0.3
-# color_posterior = '#a2c4c9'
-# color_algorithm = '#ff7878'
 dpi_val = 1200
 cmap = 'magma'
 
