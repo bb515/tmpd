@@ -126,9 +126,9 @@ def get_asset_sample(config):
                         transforms=transform)
   loader = get_dataloader(dataset, batch_size=3, num_workers=0, train=False)
   ref_img = next(iter(loader))
-  print(ref_img.shape)
+  # print(ref_img.shape)
   ref_img = ref_img.detach().cpu().numpy()[2].transpose(1, 2, 0)
-  print(np.max(ref_img), np.min(ref_img))
+  # print(np.max(ref_img), np.min(ref_img))
   ref_img = np.tile(ref_img, (config.eval.batch_size, 1, 1, 1))
   return ref_img
 

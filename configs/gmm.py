@@ -57,6 +57,8 @@ def get_config():
     solver.eta = 1.0
     # solver.outer_solver = 'SMLD'
     solver.inner_solver = None
+    solver.stsl_scale_hyperparameter = 0.02
+    solver.dps_scale_hyperparameter = 0.05
 
     # optim
     optim = config.optim

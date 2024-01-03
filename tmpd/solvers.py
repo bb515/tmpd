@@ -5,6 +5,68 @@ from diffusionjax.utils import batch_mul
 from diffusionjax.solvers import DDIMVP, DDIMVE, SMLD, DDPM
 
 
+def batch_dot(a, b):
+  return vmap(lambda a, b: a.T @ b)(a, b)
+
+
+class STSL(DDIMVP):
+  def __init__(self, scale, likelihood_strength, y, observation_map, adjoint_observation_map, noise_std, shape, model, eta=0.0, num_steps=1000, dt=None, epsilon=None, beta_min=0.1, beta_max=20.):
+    super().__init__(model, eta, num_steps, dt, epsilon, beta_min, beta_max)
+    self.estimate_h_x_0_vmap = self.get_estimate_x_0_vmap(observation_map)
+    self.y = y
+    self.noise_std = noise_std
+    self.num_y = y.shape[1]
+    self.num_x = sum([d for d in shape])
+    self.observation_map = observation_map
+    self.likelihood_score_vmap = self.get_likelihood_score_vmap(self.get_estimate_x_0_vmap(observation_map))
+    self.adjoint_observation_map = adjoint_observation_map
+    self.batch_adjoint_observation_map = vmap(adjoint_observation_map)
+    self.batch_observation_map = vmap(observation_map)
+    self.jacrev_vmap = vmap(jacrev(lambda x, t, timestep: self.estimate_h_x_0_vmap(x, t, timestep)[0]))
+    self.axes = (0,) + tuple(range(len(shape) + 4)[2:]) + (1,)
+    self.axes_vmap = tuple(range(len(shape) + 3)[1:]) + (0,)
+    self.likelihood_strength = likelihood_strength
+    self.scale = scale
+
+  def get_likelihood_score_vmap(self, estimate_h_x_0_vmap):
+    def l2_norm(x, t, timestep, y, rng):
+      m = self.sqrt_alphas_cumprod[timestep]
+      sqrt_1m_alpha = self.sqrt_1m_alphas_cumprod[timestep]
+      x = jnp.expand_dims(x, axis=0)
+      t = jnp.expand_dims(t, axis=0)
+      epsilon = self.model(x, t).squeeze(axis=0)
+      x_0 = (x.squeeze(axis=0) - sqrt_1m_alpha * epsilon) / m
+      score = - epsilon / sqrt_1m_alpha
+      z = random.normal(rng, x.shape)
+      score_perturbed = - self.model(x + z, t).squeeze(axis=0) / sqrt_1m_alpha
+      h_x_0 = self.observation_map(x_0)
+      norm = jnp.linalg.norm(y - h_x_0)
+      scalar = - self.likelihood_strength * norm - (self.scale / self.num_x) * (jnp.dot(z, score_perturbed) - jnp.dot(z, score))
+      return scalar[0], (score, x_0)
+
+    grad_l2_norm = grad(l2_norm, has_aux=True)
+    return vmap(grad_l2_norm, in_axes=(0, 0, 0, 0, None))
+
+  def update(self, rng, x, t):
+    timestep = (t * (self.num_steps - 1) / self.t1).astype(jnp.int32)
+    beta = self.discrete_betas[timestep]
+    sqrt_1m_alpha = self.sqrt_1m_alphas_cumprod[timestep]
+    v = sqrt_1m_alpha**2
+    alpha_cumprod = self.alphas_cumprod[timestep]
+    alpha_cumprod_prev = self.alphas_cumprod_prev[timestep]
+    alpha = self.alphas[timestep]
+    m_prev = self.sqrt_alphas_cumprod_prev[timestep]
+    v_prev = self.sqrt_1m_alphas_cumprod_prev[timestep]**2
+    ls, (s, x_0) = self.likelihood_score_vmap(x, t, timestep, self.y, rng)
+    x = x + ls
+    x_mean = batch_mul(jnp.sqrt(alpha) * v_prev / v, x) + batch_mul(m_prev * beta / v, x_0)
+    std = jnp.sqrt(beta * v_prev / v)
+    rng, step_rng = random.split(rng)
+    z = random.normal(step_rng, x.shape)
+    x_mean = x_mean + batch_mul(std, z)
+    return x, x_mean
+
+
 class MPGD(DDIMVP):
   """
   TODO: This method requires a pretrained autoencoder.
@@ -63,7 +125,7 @@ class MPGD(DDIMVP):
 
 
 class KGDMVP(DDIMVP):
-  """PiGDM Song et al. 2023. Markov chain using the DDIM Markov Chain or VP SDE."""
+  """Kalman Guided Diffusion Model, Markov chain using the DDIM Markov Chain or VP SDE."""
   def __init__(self, y, observation_map, noise_std, shape, model, eta=0.0, num_steps=1000, dt=None, epsilon=None, beta_min=0.1, beta_max=20.):
     super().__init__(model, eta, num_steps, dt, epsilon, beta_min, beta_max)
     self.estimate_h_x_0 = self.get_estimate_x_0(observation_map)
@@ -218,7 +280,7 @@ class PiGDMVP(DDIMVP):
 
 
 class PiGDMVPplus(PiGDMVP):
-  """KGDMVP with a mask."""
+  """PiGDMVP with a mask."""
   def analysis(self, y, x, t, timestep, v, alpha):
     h_x_0, vjp_estimate_h_x_0, (epsilon, _) = vjp(
       lambda x: self.estimate_h_x_0_vmap(x, t, timestep), x, has_aux=True)
