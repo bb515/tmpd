@@ -9,16 +9,6 @@ def batch_dot(a, b):
   return vmap(lambda a, b: a.T @ b)(a, b)
 
 
-# class STSL(DDIMVP):
-#   def __init__(self,
-#                scale, likelihood_strength,
-#                y,
-#                observation_map, adjoint_observation_map,
-#                noise_std, shape,
-#                model, eta=0.0, num_steps=1000, dt=None, epsilon=None, beta_min=0.1, beta_max=20.):
-#     super().__init__(model, eta, num_steps, dt, epsilon, beta_min, beta_max)
-
-
 class STSL(DDIMVP):
   def __init__(self, scale, likelihood_strength, y, observation_map, adjoint_observation_map, noise_std, shape, model, eta=0.0, num_steps=1000, dt=None, epsilon=None, beta_min=0.1, beta_max=20.):
     super().__init__(model, eta, num_steps, dt, epsilon, beta_min, beta_max)
@@ -69,7 +59,6 @@ class STSL(DDIMVP):
     v_prev = self.sqrt_1m_alphas_cumprod_prev[timestep]**2
     ls, (s, x_0) = self.likelihood_score_vmap(x, t, timestep, self.y, rng)
     x = x + ls
-    # x = x
     x_mean = batch_mul(jnp.sqrt(alpha) * v_prev / v, x) + batch_mul(m_prev * beta / v, x_0)
     std = jnp.sqrt(beta * v_prev / v)
     rng, step_rng = random.split(rng)
