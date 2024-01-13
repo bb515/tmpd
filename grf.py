@@ -63,43 +63,46 @@ def main(argv):
 
     # Setup SDE
     if config.training.sde.lower()=='vpsde':
-        sde = sde_lib.VP(beta_min=config.model.beta_min, beta_max=config.model.beta_max)
+      from diffusionjax.utils import get_linear_beta_function
+      beta, log_mean_coeff = get_linear_beta_function(
+        beta_min=config.model.beta_min, beta_max=config.model.beta_max)
+      sde = sde_lib.VP(beta, log_mean_coeff)
     elif config.training.sde.lower()=='vesde':
-        sde = sde_lib.VE(sigma_min=config.model.sigma_min, sigma_max=config.model.sigma_max)
+      from diffusionjax.utils import get_sigma_function
+      sigma = get_sigma_function(
+        sigma_min=config.model.sigma_min, sigma_max=config.model.sigma_max)
+      sde = sde_lib.VE(sigma)
     else:
-        raise NotImplementedError(f"SDE {config.training.SDE} unknown.")
+      raise NotImplementedError(f"SDE {config.training.SDE} unknown.")
 
     rng = random.PRNGKey(2023)
     samples, C, x, X = sample_image_rgb(
-        rng, num_samples=config.eval.batch_size//num_devices,
-        image_size=config.data.image_size, kernel=Matern52(),
-        num_channels=config.data.num_channels)  # (num_samples, image_size**2, num_channels)
-
-    # sde = VP(beta_min=1e-3, beta_max=1e1)
-    # tmp_solver = EulerMaruyama(sde)
+      rng, num_samples=config.eval.batch_size//num_devices,
+      image_size=config.data.image_size, kernel=Matern52(),
+      num_channels=config.data.num_channels)  # (num_samples, image_size**2, num_channels)
 
     if 0:
-        # Reshape image data
-        samples = samples.reshape(-1, config.data.image_size, config.data.image_size, config.data.num_channels)
-        plot_samples(samples[:64], image_size=config.data.image_size, num_channels=config.data.num_channels, fname="samples")
-        plot_samples_1D(samples[:64, ..., 0], config.data.image_size, "samples_1D", alpha=FG_ALPHA)
+      # Reshape image data
+      samples = samples.reshape(-1, config.data.image_size, config.data.image_size, config.data.num_channels)
+      plot_samples(samples[:64], image_size=config.data.image_size, num_channels=config.data.num_channels, fname="samples")
+      plot_samples_1D(samples[:64, ..., 0], config.data.image_size, "samples_1D", alpha=FG_ALPHA)
 
     def nabla_log_pt(x, t):
-        r"""
-        Args:
-            x: One location in $\mathbb{R}^{image_size**2}$
-            t: time
-        Returns:
-            The true log density.
-            .. math::
-                p_{t}(x)
-        """
-        x_shape = x.shape
-        v_t = sde.variance(t)
-        m_t = sde.mean_coeff(t)
-        x = x.flatten()
-        score = -jnp.linalg.solve(m_t**2 * C + v_t * jnp.eye(x.shape[0]), x)
-        return score.reshape(x_shape)
+      r"""
+      Args:
+          x: One location in $\mathbb{R}^{image_size**2}$
+          t: time
+      Returns:
+          The true log density.
+          .. math::
+              p_{t}(x)
+      """
+      x_shape = x.shape
+      v_t = sde.variance(t)
+      m_t = sde.mean_coeff(t)
+      x = x.flatten()
+      score = -jnp.linalg.solve(m_t**2 * C + v_t * jnp.eye(x.shape[0]), x)
+      return score.reshape(x_shape)
 
     true_score = jit(vmap(nabla_log_pt, in_axes=(0, 0), out_axes=(0)))
 
@@ -123,7 +126,8 @@ def main(argv):
             delta_t_mean, delta_t_var, delta_t_cov))
 
         # Running the reverse SDE with the true score
-        solver = EulerMaruyama(sde.reverse(true_score), num_steps=config.solver.num_outer_steps)
+        ts, _ = get_times(num_steps=config.solver.num_outer_steps)
+        solver = EulerMaruyama(sde.reverse(true_score), ts)
 
         sampler= get_sampler((config.eval.batch_size//num_devices, config.data.image_size, config.data.image_size, config.data.num_channels), solver)
         if config.eval.pmap:
@@ -155,12 +159,12 @@ def main(argv):
 
         # logging.info(delta_t_corr)  # a value of 0.05 (for 512 samples) are indistinguisable from
         # true samples due to emprical covariance error
-        # but it is possible to get a value as los as 0.005 from many more true samples
+        # but it is possible to get a value as low as 0.005 from many more true samples
         # logging.info(delta_corr)  # a value of 0.1 are good samples
 
         # # Running the reverse SDE with the true score
         # # Get the outer loop of a numerical solver, also known as "predictor"
-        # outer_solver = EulerMaruyama(sde.reverse(true_score), num_steps=config.solver.num_outer_steps)
+        # outer_solver = EulerMaruyama(sde.reverse(true_score), ts)
 
         # sampler = get_sampler((config.eval.batch_size//num_devices, config.data.image_size, config.data.image_size, config.data.num_channels), outer_solver, inner_solver, denoise=True)
         # if config.eval.pmap:
@@ -189,7 +193,7 @@ def main(argv):
 
         # logging.info(delta_t_corr)  # a value of 0.05 (for 512 samples) are indistinguisable from
         # # true samples due to emprical covariance error
-        # # but it is possible to get a value as los as 0.005 from many more true samples
+        # # but it is possible to get a value as low as 0.005 from many more true samples
         # logging.info(delta_corr)  # a value of 0.1 are good samples
 
     num_obs = int(config.data.image_size**2/64)
@@ -198,6 +202,7 @@ def main(argv):
     ogrid = np.arange(num_obs, dtype=int)
     H = H.at[ogrid, idx_obs].set(1.0)
     y = random.normal(rng, idx_obs.shape) * jnp.sqrt(1.0 + config.sampling.noise_std)
+    print(y.shape)
     y_data = y.copy()
     X_data = X[idx_obs, :]
 
@@ -255,7 +260,7 @@ def main(argv):
         sampler = get_cs_sampler(
             config, sde, true_score, sampling_shape,
             config.sampling.inverse_scaler,
-            y, num_obs, H,
+            jnp.tile(y, (batch_size, 1)), H,  # TODO: not sure about this
             observation_map, adjoint_observation_map,
             stack_samples=False)
         if config.eval.pmap:
