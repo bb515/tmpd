@@ -6,14 +6,9 @@ https://www.cl.cam.ac.uk/teaching/1011/R08/jpeg/acs10-jpeg.pdf JPEG tutorial And
 CUED IIB 4F8: Image Coding 2019-2020 - Lecture 3: The DCT and the JPEG Standard J Lasenby Signal Processing Group, Engineering Department, Cambridge, UK
 """
 import numpy as np
-from pathlib import Path
 import jax
 import jax.numpy as jnp
 from jax import vjp
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from torchvision.datasets import VisionDataset
 from typing import Callable, Optional
 import torchvision.transforms as transforms
@@ -72,13 +67,13 @@ def dct(x, norm=None):
     return 2 * V.reshape(x_shape)
 
 
-def idct_test(X, norm):
-    x_torch = np.array(idct_torch(torch.from_numpy(np.array(X)), norm))
-    x = np.array(idct(X, norm))
-    print(x_torch)
-    print(x)
-    assert np.allclose(x_torch, x)
-    assert 0
+# def idct_test(X, norm):
+#     x_torch = np.array(idct_torch(torch.from_numpy(np.array(X)), norm))
+#     x = np.array(idct(X, norm))
+#     print(x_torch)
+#     print(x)
+#     assert np.allclose(x_torch, x)
+#     assert 0
 
 
 def idct(x, norm=None):
@@ -191,7 +186,7 @@ def get_dct(in_features, _type, norm=None, bias=False):
     :param type: which dct function in this file to use."""
 
     # initialise using dct function
-    I = torch.eye(in_features)
+    # I = torch.eye(in_features)
 
     if _type == 'dct1':
         return dct1

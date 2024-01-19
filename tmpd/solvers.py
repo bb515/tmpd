@@ -53,8 +53,6 @@ class STSL(DDIMVP):
     beta = self.discrete_betas[timestep]
     sqrt_1m_alpha = self.sqrt_1m_alphas_cumprod[timestep]
     v = sqrt_1m_alpha**2
-    alpha_cumprod = self.alphas_cumprod[timestep]
-    alpha_cumprod_prev = self.alphas_cumprod_prev[timestep]
     alpha = self.alphas[timestep]
     m_prev = self.sqrt_alphas_cumprod_prev[timestep]
     v_prev = self.sqrt_1m_alphas_cumprod_prev[timestep]**2
@@ -184,8 +182,6 @@ class KGDMVE(DDIMVE):
     super().__init__(model, eta, sigma, ts)
     self.eta = eta
     self.model = model
-    self.sigma_min = sigma_min
-    self.sigma_max = sigma_max
     self.discrete_sigmas = jnp.exp(
         jnp.linspace(jnp.log(self.sigma_min),
                       jnp.log(self.sigma_max),
@@ -294,8 +290,8 @@ class SSPiGDMVP(DDIMVP):
   """
   Note: We found this method to be unstable on all datasets.
   PiGDM Song et al. 2023. Markov chain using the DDIM Markov Chain or VP SDE."""
-  def __init__(self, y, observation_map, noise_std, shape, model, eta=0.0, num_steps=1000, dt=None, epsilon=None, beta_min=0.1, beta_max=20.):
-    super().__init__(model, eta, num_steps, dt, epsilon, beta_min, beta_max)
+  def __init__(self, y, observation_map, noise_std, shape, model, eta=0.0, beta=None, ts=None):
+    super().__init__(model, eta, beta, ts)
     self.estimate_h_x_0 = self.get_estimate_x_0_vmap(observation_map)
     self.batch_analysis_vmap = vmap(self.analysis)
     self.y = y
@@ -334,8 +330,6 @@ class PiGDMVE(DDIMVE):
     super().__init__(model, eta, sigma, ts)
     self.eta = eta
     self.model = model
-    self.sigma_min = sigma_min
-    self.sigma_max = sigma_max
     self.discrete_sigmas = jnp.exp(
         jnp.linspace(jnp.log(self.sigma_min),
                     jnp.log(self.sigma_max),

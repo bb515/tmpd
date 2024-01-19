@@ -1,0 +1,78 @@
+scratch buffer for solving this problem.
+
+num_batch = 4
+image_size = 256
+
+Image data in luminosity [0] and chroma channels [1, 2]
+
+(N, C, H, W)
+x_luma (4, 1, 256, 256)
+x_chroma (4, 2, 128, 128)
+
+x_luma = jax.lax.conv_general_dilated_patches(lhs=x_luma, filter_shape=[8, 8], padding='SAME', window_strides=[8, 8])
+x_chroma = jax.lax.conv_general_dilated_patches(lhs=x_chroma, filter_shape=[8, 8], padding='SAME', window_strides=[8, 8])
+
+x_luma shape (4, 64, 32, 32)
+x_chroma shape (4, 128, 16, 16)
+
+deleteme
+(4, 1, 256, 256)
+(4, 2, 128, 128)
+(4, 64, 32, 32)
+(4, 128, 16, 16)
+
+x_luma = x_luma.reshape(x_luma.shape[0], x_luma.shape[1], -1)
+x_chroma = x_chroma.reshape(x_chroma.shape[0], x_chroma.shape[1], -1)
+x_luma shape  (4, 64, 1024)
+x_chroma shape (4, 128, 256)
+
+x_luma = x_luma.transpose(0, 2, 1)
+x_chroma = x_chroma.transpose(0, 2, 1)
+x_luma shape (4, 1024, 64)
+x_chroma shape (4, 256, 128)
+
+x_luma = x_luma.reshape(-1, 8, 8) - 128.
+x_chroma = x_chroma.reshape(-1, 8, 8) - 128.
+(4096, 8, 8)
+(2048, 8, 8)
+
+dct_layer = get_dct(8, 'dct', norm='ortho')
+x_luma = apply_linear_2d(x_luma, dct_layer)
+x_chroma = apply_linear_2d(x_chroma, dct_layer)
+# These are the basis weight for 4096 (luma) or 2048 (chroma) patches (which
+# represent the batch of four subsampled (32, 32) or (16, 16) channels)
+# of 8 by 8 blocks of pixels. Each 8 by 8 block of basis weights represents the weights for the 64 cosine basis vectors.
+(4096, 8, 8)
+(2048, 8, 8)
+
+# Reshape to recover channels in the shape
+x_luma = x_luma.reshape(-1, 1, 8, 8)
+x_chroma = x_chroma.reshape(-1, 2, 8, 8)
+(4096, 1, 8, 8)
+(1024, 2, 8, 8)
+
+# Reshape into 64 (32. 32) (chroma coefficients, because patch_size * image_size // patch_size = 8 * 32 = 256 = image_size) and (16, 16) (luma coefficients) sub images per channel
+x_luma = x_luma.reshape(num_batch, (image_size // 8) ** 2, 64).transpose(0, 2, 1)
+x_chroma = x_chroma.reshape(num_batch, (image_size // 16) ** 2, 64 * 2).transpose(0, 2, 1)
+(4, 64, 1024)
+(4, 128, 256)
+
+# This operation puts the sub-images into an encoded state that can be interpreted pixel by pixel, with the use of some kind of convolution operation
+
+# I think that this will be just some fancy reshaping?
+
+# It is then decoded somehow.
+
+
+
+# Don't I just sum up all sub images?
+
+# This operation preserves the sum of the dimensions, so perhaps just a reshape will do? A: no, they are different operations
+fold = nn.Fold(output_size=(image_size, image_size), kernel_size=(8, 8), stride=(8, 8))
+x_luma_torch = fold(x_luma_torch)
+fold = nn.Fold(output_size=(image_size // 2, image_size // 2), kernel_size=(8, 8), stride=(8, 8))
+x_chroma_torch = fold(x_chroma_torch)
+torch.Size([4, 1, 256, 256])
+torch.Size([4, 2, 128, 128])
+
+256, 256

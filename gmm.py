@@ -16,7 +16,7 @@ from diffusionjax.plot import plot_heatmap
 from diffusionjax.utils import get_sampler
 from diffusionjax.run_lib import get_ddim_chain
 import diffusionjax.sde as sde_lib
-from tmpd.samplers import get_cs_sampler, get_stsl_sampler
+from tmpd.samplers import get_cs_sampler
 from tmpd.plot import plot_single_image, plot_image
 import numpy as np
 import logging

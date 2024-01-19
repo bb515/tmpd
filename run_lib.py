@@ -12,9 +12,9 @@ import logging
 from flax.training import checkpoints
 # NOTE: Keep the import below for registering all model definitions
 from models import ddpm, ncsnv2, ncsnpp
+from models import utils as mutils
 import losses
 from evaluation import get_inception_model, load_dataset_stats, run_inception_distributed
-from models import utils as mutils
 import datasets
 from absl import flags
 FLAGS = flags.FLAGS
@@ -733,7 +733,7 @@ def super_resolution(config, workdir, eval_folder="eval"):
   ckpt = config.eval.begin_ckpt
   # Create data normalizer and its inverse
 
-  scaler = datasets.get_data_scaler(config)
+  # scaler = datasets.get_data_scaler(config)
   inverse_scaler = datasets.get_data_inverse_scaler(config)
 
   # Get model state from checkpoint file
@@ -834,7 +834,7 @@ def super_resolution(config, workdir, eval_folder="eval"):
         img = image_grid(
           q_samples[-1],
           config.data.image_size, config.data.num_channels)
-        im = ax.imshow(img, interpolation=None)
+        ax.imshow(img, interpolation=None)
         fig.tight_layout()
         def animate(i, ax):
           ax.clear()
@@ -1074,7 +1074,7 @@ def evaluate_inpainting(config,
   rng = random.PRNGKey(config.seed + 1)
 
   # Create data normalizer and its inverse
-  scaler = datasets.get_data_scaler(config)
+  # scaler = datasets.get_data_scaler(config)
   inverse_scaler = datasets.get_data_inverse_scaler(config)
 
   # Initialize model
@@ -1369,7 +1369,7 @@ def dps_search_inpainting(
   rng = random.PRNGKey(config.seed + 1)
 
   # Create data normalizer and its inverse
-  scaler = datasets.get_data_scaler(config)
+  # scaler = datasets.get_data_scaler(config)
   inverse_scaler = datasets.get_data_inverse_scaler(config)
 
   # Initialize model
@@ -1571,7 +1571,7 @@ def dps_search_super_resolution(config,
   rng = random.PRNGKey(config.seed + 1)
 
   # Create data normalizer and its inverse
-  scaler = datasets.get_data_scaler(config)
+  # scaler = datasets.get_data_scaler(config)
   inverse_scaler = datasets.get_data_inverse_scaler(config)
 
   # Initialize model

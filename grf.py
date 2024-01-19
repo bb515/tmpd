@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 from diffusionjax.plot import plot_heatmap, plot_samples, plot_samples_1D
 from diffusionjax.solvers import EulerMaruyama
 import diffusionjax.sde as sde_lib
-from diffusionjax.utils import get_sampler
+from diffusionjax.utils import get_sampler, get_times
 from mlkernels import Matern52
 import lab as B
 import numpy as np

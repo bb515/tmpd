@@ -22,7 +22,6 @@ import ot
 from tqdm import trange
 import time
 from cycler import cycler
-from matplotlib import cm
 from matplotlib.gridspec import GridSpec
 import matplotlib.animation as animation
 
@@ -42,8 +41,7 @@ ddim_methods = ['PiGDMVP', 'PiGDMVE', 'DDIMVE', 'DDIMVP', 'KGDMVP', 'KGDMVE']
 FLAGS = flags.FLAGS
 config_flags.DEFINE_config_file(
     "config", "./configs/animation.py", "Training configuration.", lock_config=True)
-flags.DEFINE_string("workdir", "./workdir", "Work directory.")
-flags.mark_flags_as_required(["workdir", "config"])
+flags.mark_flags_as_required(["config"])
 logger = logging.getLogger(__name__)
 
 
@@ -468,7 +466,6 @@ def ou_mixt_numpyro(mean_coeff, means, dim, weights):
 
 
 def main(argv):
-    workdir = FLAGS.workdir
     config = FLAGS.config
     jax.default_device = jax.devices()[0]
     # Tip: use CUDA_VISIBLE_DEVICES to restrict the devices visible to jax
