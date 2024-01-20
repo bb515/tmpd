@@ -237,6 +237,19 @@ def get_inpainting_observation(rng, x, config, mask_name='square'):
   return x, y, mask, num_obs
 
 
+def get_colorization_observation(rng, x, config, mask_name='square'):
+  " "
+  grayscale = jnp.array([0.299, 0.587, 0.114])
+  grayscale = grayscale.reshape(1, 1, 1, -1)
+  x = x * grayscale
+  x = jnp.sum(x, axis=3)
+  x = flatten_vmap(x)
+  y = x + random.normal(rng, x.shape) * config.sampling.noise_std
+  # y = y * mask
+  num_obs = x.size
+  return x, y, grayscale, num_obs
+
+
 def get_superresolution_observation(rng, x, config, shape, method='square'):
   y = jax.image.resize(x, shape, method)
   y = y + random.normal(rng, y.shape) * config.sampling.noise_std
@@ -282,11 +295,15 @@ def image_grid(x, image_size, num_channels):
     return img.reshape((w, w, image_size, image_size, num_channels)).transpose((0, 2, 1, 3, 4)).reshape((w * image_size, w * image_size, num_channels))
 
 
-def plot_samples(x, image_size=32, num_channels=3, fname="samples"):
+def plot_samples(x, image_size=32, num_channels=3, fname="samples", grayscale=False):
     img = image_grid(x, image_size, num_channels)
     plt.figure(figsize=(8,8))
     plt.axis('off')
     # NOTE: imshow resamples images so that the display image may not be the same resolution as the input
+    if not grayscale:
+      plt.imshow(img, interpolation=None)
+    else:
+      plt.imshow(img, cmap='gray', vmin=.0, vmax=1.)
     plt.imshow(img, interpolation=None)
     plt.savefig(fname + '.png', bbox_inches='tight', pad_inches=0.0)
     plt.savefig(fname + '.pdf', bbox_inches='tight', pad_inches=0.0)
@@ -825,6 +842,10 @@ def super_resolution(config, workdir, eval_folder="eval"):
           (config.solver.num_outer_steps, config.eval.batch_size,) + sampling_shape[1:])
         frames = 100
 
+        np.savez(eval_folder + "/{}_{}_{}_{}.npz".format(
+          config.sampling.noise_std, config.data.dataset, config.sampling.cs_method, i),
+          samples=q_samples)
+
         fig = plt.figure(figsize=[1,1])
         ax = fig.add_axes([0, 0, 1, 1])
         ax.axis('off')
@@ -838,7 +859,7 @@ def super_resolution(config, workdir, eval_folder="eval"):
         fig.tight_layout()
         def animate(i, ax):
           ax.clear()
-          idx = 1000 - int((i + 1) * config.solver.num_outer_steps / frames)
+          idx = config.solver.num_outer_steps - int((i + 1) * config.solver.num_outer_steps / frames)
           img = image_grid(
             q_samples[idx],
             config.data.image_size, config.data.num_channels)
@@ -917,6 +938,7 @@ def inpainting(config, workdir, eval_folder="eval"):
 
   x = get_asset_sample(config)
   _, y, mask, num_obs = get_inpainting_observation(rng, x, config, mask_name='square')
+  # _, y, mask, num_obs = get_colorization_observation(rng, x, config, mask_name='half')
   for i in range(num_sampling_rounds):
     # x = get_eval_sample(scaler, config, num_devices)
     # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, inverse_scaler, sampling_shape, config, eval_folder)
@@ -955,6 +977,13 @@ def inpainting(config, workdir, eval_folder="eval"):
       def observation_map(x):
           x = x.flatten()
           return mask * x
+      # def observation_map(x):
+      #   grayscale = jnp.array([0.299, 0.587, 0.114])
+      #   grayscale = grayscale.reshape(1, 1, 1, -1)
+      #   x = x * grayscale
+      #   x = jnp.sum(x, axis=3)
+      #   return x.flatten()
+
       adjoint_observation_map = None
       H = None
 
