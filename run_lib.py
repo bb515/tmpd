@@ -960,6 +960,61 @@ def jpeg(config, workdir, eval_folder="eval"):
     _, y, (patches_to_image_luma, patches_to_image_chroma), num_obs = get_jpeg_observation(rng, x, config, quality_factor=quality_factor)
     plot_samples(y, image_size=config.data.image_size, num_channels=config.data.num_channels,
                  fname="test.png")
+
+    plot_samples(
+      inverse_scaler(x.copy()),
+      image_size=config.data.image_size,
+      num_channels=config.data.num_channels,
+      fname=eval_folder + "/_{}_ground_{}_{}".format(
+        config.sampling.noise_std, config.data.dataset, i))
+    plot_samples(
+      inverse_scaler(y.copy()),
+      image_size=config.data.image_size,
+      num_channels=config.data.num_channels,
+      fname=eval_folder + "/_{}_observed_{}_{}".format(
+        config.sampling.noise_std, config.data.dataset, i))
+    np.savez(eval_folder + "/{}_{}_ground_observed_{}.npz".format(
+      config.sampling.noise_std, config.data.dataset, i),
+      x=x, y=y, noise_std=config.sampling.noise_std)
+
+    if 'plus' not in config.sampling.cs_method:
+      raise ValueError("Nonlinear observation map is not compatible.")
+    else:
+      def observation_map(x):
+        x_shape = x.shape
+        # TODO: it would make more sense if observation map was just an encoder
+        return jpeg_decode(jpeg_encode(x, quality_factor, patches_to_image_luma, patches_to_image_chroma, x_shape), quality_factor, patches_to_image_luma, patches_to_image_chroma, x_shape)
+
+      adjoint_observation_map = None
+      H = None
+
+    for cs_method in cs_methods:
+      config.sampling.cs_method = cs_method
+      if cs_method in ddim_methods:
+        sampler = get_cs_sampler(config, sde, epsilon_fn, sampling_shape, inverse_scaler,
+          y, H, observation_map, adjoint_observation_map, stack_samples=False)
+      else:
+        sampler = get_cs_sampler(config, sde, score_fn, sampling_shape, inverse_scaler,
+          y, H, observation_map, adjoint_observation_map, stack_samples=False)
+
+      rng, sample_rng = random.split(rng, 2)
+      if config.eval.pmap:
+        sampler = jax.pmap(sampler, axis_name='batch')
+        rng, *sample_rng = random.split(rng, jax.local_device_count() + 1)
+        sample_rng = jnp.asarray(sample_rng)
+      else:
+        rng, sample_rng = random.split(rng, 2)
+
+      time_prev = time.time()
+      q_samples, _ = sampler(sample_rng)
+      sample_time = time.time() - time_prev
+      print("{}: {}s".format(cs_method, sample_time))
+      q_samples = q_samples.reshape((config.eval.batch_size,) + sampling_shape[1:])
+      plot_samples(
+        q_samples,
+        image_size=config.data.image_size,
+        num_channels=config.data.num_channels,
+        fname=eval_folder + "/{}_{}_{}_{}".format(config.sampling.noise_std, config.data.dataset, config.sampling.cs_method.lower(), i))
     assert 0
   # x = jnp.array(get_eval_sample(config, ))
   # x = jnp.array(get_asset_sample(config))
