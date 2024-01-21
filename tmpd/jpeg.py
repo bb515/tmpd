@@ -305,11 +305,12 @@ def get_asset_sample():
   return ref_img
 
 
-def jax_rgb2ycbcr(x):
+def jax_rgb2ycbcr(shape, x):
     """Args: param x: Input signal. Assumes x in range [0, 1] and shape (N, H, W, C)."""
     # Get from [0, 1] to [0, 255]
     x = x * 255
-    plt.imshow(image_grid(jnp.uint8(x.copy()), 256, 3), interpolation='None')
+    plt.imshow(image_grid(
+        jnp.uint8(x.copy()), *shape[-2:]), interpolation='None')
     plt.savefig("test_rgb.png")
     v = jnp.array([[.299, .587, .114], [-.1687, -.3313, .5], [.5, -.4187, -.0813]])
     ycbcr = x.dot(v.T)
@@ -392,14 +393,14 @@ def get_patches_to_images(shape):
     return patches_to_image_luma, patches_to_image_chroma
 
 
-def jpeg_encode(x, quality_factor, patches_to_images_luma, patches_to_images_chroma, shape):
+def jpeg_encode(x, quality_factor, patches_to_image_luma, patches_to_image_chroma, shape):
     """
     Args: params:
       x: A batch of size (N x H x W x C) and in [0, 255].
       quality_factor: Quality factor
     """
-    num_batch, image_size, _, num_channels = shape
-    x = jax_rgb2ycbcr(x)
+    # num_batch, image_size, _, num_channels = shape
+    x = jax_rgb2ycbcr(shape, x)
     x_luma, x_chroma = chroma_subsample(x)
     # Get x_luma, x_chroma is a batch of size (N x C x H x W)
     x_luma = x_luma.transpose(0, 3, 1, 2)
@@ -429,7 +430,7 @@ def jpeg_encode(x, quality_factor, patches_to_images_luma, patches_to_images_chr
     return [x_luma, x_chroma]
 
 
-def jpeg_decode(x, quality_factor, patches_to_images_luma, patches_to_images_chroma, shape):
+def jpeg_decode(x, quality_factor, patches_to_image_luma, patches_to_image_chroma, shape):
     """
     :Args:
         param x: Assume x[0] is a batch of size (N x H//8 x W//8, 1, 8, 8). Assume x[1:] is a batch of size (N x H//8 x W//8, 1, 8, 8)
@@ -462,7 +463,7 @@ def jpeg_decode(x, quality_factor, patches_to_images_luma, patches_to_images_chr
     # x = (x - jnp.min(x)) / (jnp.max(x) - jnp.min(x))
     # print(jnp.max(x))
     # print(jnp.min(x))
-    plt.imshow(image_grid(x.copy(), 256, 3), interpolation='None')
+    plt.imshow(image_grid(x.copy(), *shape[-2:]), interpolation='None')
     # plt.imshow(image_grid(jnp.uint8(x.copy()), 256, 3), interpolation='None')
     plt.savefig("test_decode.png")
     return x
@@ -486,12 +487,3 @@ def quantization_encode(x, quality_factor):
 def quantization_decode(x, quality_factor):
     return x
 
-
-x = jnp.array(get_asset_sample())
-patches_to_image_luma, patches_to_image_chroma = get_patches_to_images(x.shape)
-y = jax_rgb2ycbcr(x)
-jax_ycbcr2rgb(y)
-quality_factor = 75.
-shape = x.shape
-X = jpeg_encode(x, quality_factor, patches_to_image_luma, patches_to_image_chroma, shape)
-x = jpeg_decode(X, quality_factor, patches_to_image_luma, patches_to_image_chroma, shape)

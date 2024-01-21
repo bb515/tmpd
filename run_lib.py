@@ -20,10 +20,11 @@ from absl import flags
 FLAGS = flags.FLAGS
 from diffusionjax.sde import VP, VE
 from diffusionjax.solvers import EulerMaruyama
-from diffusionjax.utils import get_sampler, batch_matmul_A
+from diffusionjax.utils import get_sampler, batch_matmul_A, get_linear_beta_function, get_sigma_function
 from diffusionjax.run_lib import get_solver, get_markov_chain, get_ddim_chain
 from tmpd.samplers import get_cs_sampler
 from tmpd.inpainting import get_mask
+from tmpd.jpeg import jax_rgb2ycbcr, jax_ycbcr2rgb, jpeg_encode, jpeg_decode, get_patches_to_images
 from tmpd.plot import plot_animation
 import matplotlib.pyplot as plt
 from tensorflow.image import ssim as tf_ssim
@@ -175,7 +176,8 @@ def get_eval_sample(scaler, config, num_devices):
 def get_sde(config):
   # Setup SDEs
   if config.training.sde.lower() == 'vpsde':
-    sde = VP(beta_min=config.model.beta_min, beta_max=config.model.beta_max)
+    beta = get_linear_beta_function(beta_min=config.model.beta_min, beta_max=config.model.beta_max)
+    sde = VP(beta)
     if 'plus' not in config.sampling.cs_method:
       # VP/DDPM Methods with matrix H
       cs_methods = [
@@ -197,7 +199,8 @@ def get_sde(config):
                     'Song2023plus',
                     ]
   elif config.training.sde.lower() == 'vesde':
-    sde = VE(sigma_min=config.model.sigma_min, sigma_max=config.model.sigma_max)
+    sigma = get_sigma_function(sigma_min=config.model.sigma_min, sigma_max=config.model.sigma_max)
+    sde = VE(sigma)
     if 'plus' not in config.sampling.cs_method:
       # VE/SMLD Methods with matrix H
       cs_methods = [
@@ -226,6 +229,17 @@ def get_sde(config):
   else:
     raise NotImplementedError(f"SDE {config.training.sde} unknown.")
   return cs_methods, sde
+
+
+def get_jpeg_observation(rng, x, config, quality_factor=75.):
+  x_shape = x.shape
+  patches_to_image_luma, patches_to_image_chroma = get_patches_to_images(x_shape)
+  quality_factor = 75.
+  X = jpeg_encode(x, quality_factor, patches_to_image_luma, patches_to_image_chroma, x_shape)
+  x = jpeg_decode(X, quality_factor, patches_to_image_luma, patches_to_image_chroma, x_shape)
+  y = x + random.normal(rng, x_shape) * config.sampling.noise_std
+  num_obs = jnp.size(y)
+  return x, y, (patches_to_image_luma, patches_to_image_chroma), num_obs
 
 
 def get_inpainting_observation(rng, x, config, mask_name='square'):
@@ -887,6 +901,72 @@ def super_resolution(config, workdir, eval_folder="eval"):
           fname=eval_folder + "/{}_{}_{}_{}".format(config.data.dataset, config.sampling.noise_std, config.sampling.cs_method.lower(), i))
 
 
+def jpeg(config, workdir, eval_folder="eval"):
+  # Tip: use CUDA_VISIBLE_DEVICES to restrict the devices visible to jax
+  # ... they must be all the same model of device for pmap to work
+  num_devices =  int(jax.local_device_count()) if config.eval.pmap else 1
+
+  # Create directory to eval_folder
+  eval_dir = os.path.join(workdir, eval_folder)
+  tf.io.gfile.makedirs(eval_dir)
+
+  rng = random.PRNGKey(config.seed + 1)
+
+  # Initialize model
+  rng, model_rng = random.split(rng)
+  score_model, init_model_state, initial_params = mutils.init_model(model_rng, config, num_devices)
+  optimizer = losses.get_optimizer(config).create(initial_params)
+  state = mutils.State(step=0, optimizer=optimizer, lr=config.optim.lr,
+                       model_state=init_model_state,
+                       ema_rate=config.model.ema_rate,
+                       params_ema=initial_params,
+                       rng=rng)  # pytype: disable=wrong-keyword-args
+  checkpoint_dir = workdir
+  cs_methods, sde = get_sde(config)
+
+  # Create data normalizer and its inverse
+  scaler = datasets.get_data_scaler(config)
+  inverse_scaler = datasets.get_data_inverse_scaler(config)
+
+  # Get model state from checkpoint file
+  ckpt = config.eval.begin_ckpt
+  ckpt_filename = os.path.join(checkpoint_dir, "checkpoint_{}".format(ckpt))
+  if not tf.io.gfile.exists(ckpt_filename):
+    raise FileNotFoundError("{} does not exist".format(ckpt_filename))
+
+  state = checkpoints.restore_checkpoint(checkpoint_dir, state, step=ckpt)
+  epsilon_fn = mutils.get_epsilon_fn(
+    sde, score_model, state.params_ema, state.model_state, train=False, continuous=True)
+  score_fn = mutils.get_score_fn(
+    sde, score_model, state.params_ema, state.model_state, train=False, continuous=True)
+  batch_size = config.eval.batch_size
+  print("\nbatch_size={}".format(batch_size))
+  sampling_shape = (
+    config.eval.batch_size//num_devices,
+    config.data.image_size, config.data.image_size, config.data.num_channels)
+  print("sampling shape", sampling_shape)
+
+  # Create different random states for different hosts in a multi-host environment (e.g., TPU pods)
+  rng = random.fold_in(rng, jax.host_id())
+  num_sampling_rounds = 2
+  quality_factor = 75.
+
+  # x = get_asset_sample(config)
+  # _, y, mask, num_obs = get_inpainting_observation(rng, x, config, mask_name='square')
+  # _, y, mask, num_obs = get_colorization_observation(rng, x, config, mask_name='half')
+  for i in range(num_sampling_rounds):
+    x = get_eval_sample(scaler, config, num_devices)
+    # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, inverse_scaler, sampling_shape, config, eval_folder)
+    _, y, (patches_to_image_luma, patches_to_image_chroma), num_obs = get_jpeg_observation(rng, x, config, quality_factor=quality_factor)
+    plot_samples(y, image_size=config.data.image_size, num_channels=config.data.num_channels,
+                 fname="test.png")
+    assert 0
+  # x = jnp.array(get_eval_sample(config, ))
+  # x = jnp.array(get_asset_sample(config))
+  # print(x.shape)
+  # assert 0
+
+
 def inpainting(config, workdir, eval_folder="eval"):
   # Tip: use CUDA_VISIBLE_DEVICES to restrict the devices visible to jax
   # ... they must be all the same model of device for pmap to work
@@ -1415,7 +1495,8 @@ def dps_search_inpainting(
 
   # Setup SDEs
   if config.training.sde.lower() == 'vpsde':
-    sde = VP(beta_min=config.model.beta_min, beta_max=config.model.beta_max)
+    beta = get_linear_beta_function(beta_min=config.model.beta_min, beta_max=config.model.beta_max)
+    sde = VP(beta)
     if 'plus' not in config.sampling.cs_method:
       # VP/DDPM Methods with matrix H
       # cs_method = 'chung2022scalar'
@@ -1425,7 +1506,8 @@ def dps_search_inpainting(
       # cs_method = 'chung2022scalarplus'
       cs_method = 'DPSDDPMplus'
   elif config.training.sde.lower() == 'vesde':
-    sde = VE(sigma_min=config.model.sigma_min, sigma_max=config.model.sigma_max)
+    sigma = get_sigma_function(sigma_min=config.model.sigma_min, sigma_max=config.model.sigma_max)
+    sde = VE(sigma)
     if 'plus' not in config.sampling.cs_method:
       # VE/SMLD Methods with matrix H
       # cs_method = 'chung2022scalar'
@@ -1617,7 +1699,8 @@ def dps_search_super_resolution(config,
 
   # Setup SDEs
   if config.training.sde.lower() == 'vpsde':
-    sde = VP(beta_min=config.model.beta_min, beta_max=config.model.beta_max)
+    beta = get_linear_beta_function(beta_min=config.model.beta_min, beta_max=config.model.beta_max)
+    sde = VP(beta)
     if 'plus' not in config.sampling.cs_method:
       # VP/DDPM Methods with matrix H
       # cs_method = 'chung2022scalar'
@@ -1627,7 +1710,8 @@ def dps_search_super_resolution(config,
       # cs_method = 'chung2022scalarplus'
       cs_method = 'DPSDDPMplus'
   elif config.training.sde.lower() == 'vesde':
-    sde = VE(sigma_min=config.model.sigma_min, sigma_max=config.model.sigma_max)
+    beta = get_sigma_function(sigma_min=config.model.sigma_min, sigma_max=config.model.sigma_max)
+    sde = VE(beta)
     if 'plus' not in config.sampling.cs_method:
       # VE/SMLD Methods with matrix H
       # cs_method = 'chung2022scalar'
