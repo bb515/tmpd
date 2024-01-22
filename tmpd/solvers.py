@@ -330,10 +330,6 @@ class PiGDMVE(DDIMVE):
     super().__init__(model, eta, sigma, ts)
     self.eta = eta
     self.model = model
-    self.discrete_sigmas = jnp.exp(
-        jnp.linspace(jnp.log(self.sigma_min),
-                    jnp.log(self.sigma_max),
-                    self.num_steps))
     self.y = y
     self.data_variance = data_variance
     self.noise_std = noise_std

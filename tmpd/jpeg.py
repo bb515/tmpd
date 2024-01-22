@@ -305,13 +305,13 @@ def get_asset_sample():
   return ref_img
 
 
-def jax_rgb2ycbcr(shape, x):
+def jax_rgb2ycbcr(x):
     """Args: param x: Input signal. Assumes x in range [0, 1] and shape (N, H, W, C)."""
     # Get from [0, 1] to [0, 255]
     x = x * 255
-    plt.imshow(image_grid(
-        jnp.uint8(x.copy()), *shape[-2:]), interpolation='None')
-    plt.savefig("test_rgb.png")
+    # plt.imshow(image_grid(
+    #     jnp.uint8(x), *shape[-2:]), interpolation='None')
+    # plt.savefig("test_rgb.png")
     v = jnp.array([[.299, .587, .114], [-.1687, -.3313, .5], [.5, -.4187, -.0813]])
     ycbcr = x.dot(v.T)
     ycbcr = ycbcr.at[:, :, :, 1:].set(ycbcr[:, :, :, 1:] + 128)
@@ -365,11 +365,15 @@ def general_quant_matrix(quality_factor=10):
     ])
     s = (5000 / quality_factor) if quality_factor < 50 else (200 - 2 * quality_factor)
     q1 = jnp.floor((s * q1 + 50) / 100)
-    q1 = q1.at[q1 <= 0].set(1)
-    q1 = q1.at[q1 > 255].set(255)
+    q1 = jnp.where(q1 < 0, 0, q1)
+    q1 = jnp.where(q1 > 255, 255, q1)
+    # q1 = q1.at[q1 < 0].set(0)
+    # q1 = q1.at[q1 > 255].set(255)
     q2 = jnp.floor((s * q2 + 50) / 100)
-    q2 = q2.at[q2 <= 0].set(1)
-    q2 = q2.at[q2 > 255].set(255)
+    q2 = jnp.where(q2 < 0, 0, q2)
+    q2 = jnp.where(q2 > 255, 255, q2)
+    # q2 = q2.at[q2 < 0].set(0)
+    # q2 = q2.at[q2 > 255].set(255)
     return q1, q2
 
 
@@ -400,7 +404,7 @@ def jpeg_encode(x, quality_factor, patches_to_image_luma, patches_to_image_chrom
       quality_factor: Quality factor
     """
     # num_batch, image_size, _, num_channels = shape
-    x = jax_rgb2ycbcr(shape, x)
+    x = jax_rgb2ycbcr(x)
     x_luma, x_chroma = chroma_subsample(x)
     # Get x_luma, x_chroma is a batch of size (N x C x H x W)
     x_luma = x_luma.transpose(0, 3, 1, 2)
@@ -463,9 +467,9 @@ def jpeg_decode(x, quality_factor, patches_to_image_luma, patches_to_image_chrom
     # x = (x - jnp.min(x)) / (jnp.max(x) - jnp.min(x))
     # print(jnp.max(x))
     # print(jnp.min(x))
-    plt.imshow(image_grid(x.copy(), *shape[-2:]), interpolation='None')
+    # plt.imshow(image_grid(x.copy(), *shape[-2:]), interpolation='None')
     # plt.imshow(image_grid(jnp.uint8(x.copy()), 256, 3), interpolation='None')
-    plt.savefig("test_decode.png")
+    # plt.savefig("test_decode.png")
     return x
 
 

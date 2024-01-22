@@ -24,7 +24,7 @@ from diffusionjax.utils import get_sampler, batch_matmul_A, get_linear_beta_func
 from diffusionjax.run_lib import get_solver, get_markov_chain, get_ddim_chain
 from tmpd.samplers import get_cs_sampler
 from tmpd.inpainting import get_mask
-from tmpd.jpeg import jax_rgb2ycbcr, jax_ycbcr2rgb, jpeg_encode, jpeg_decode, get_patches_to_images
+from tmpd.jpeg import jpeg_encode, jpeg_decode, get_patches_to_images
 from tmpd.plot import plot_animation
 import matplotlib.pyplot as plt
 from tensorflow.image import ssim as tf_ssim
@@ -233,8 +233,10 @@ def get_sde(config):
 
 def get_jpeg_observation(rng, x, config, quality_factor=75.):
   x_shape = x.shape
+  print(x_shape)
   patches_to_image_luma, patches_to_image_chroma = get_patches_to_images(x_shape)
   quality_factor = 75.
+  x = jnp.array(x)
   X = jpeg_encode(x, quality_factor, patches_to_image_luma, patches_to_image_chroma, x_shape)
   x = jpeg_decode(X, quality_factor, patches_to_image_luma, patches_to_image_chroma, x_shape)
   y = x + random.normal(rng, x_shape) * config.sampling.noise_std
@@ -959,7 +961,7 @@ def jpeg(config, workdir, eval_folder="eval"):
     # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, inverse_scaler, sampling_shape, config, eval_folder)
     _, y, (patches_to_image_luma, patches_to_image_chroma), num_obs = get_jpeg_observation(rng, x, config, quality_factor=quality_factor)
     plot_samples(y, image_size=config.data.image_size, num_channels=config.data.num_channels,
-                 fname="test.png")
+                 fname="test")
 
     plot_samples(
       inverse_scaler(x.copy()),
@@ -981,12 +983,17 @@ def jpeg(config, workdir, eval_folder="eval"):
       raise ValueError("Nonlinear observation map is not compatible.")
     else:
       def observation_map(x):
+        if x.ndim == 3: x = jnp.expand_dims(x, axis=0)
         x_shape = x.shape
         # TODO: it would make more sense if observation map was just an encoder
         return jpeg_decode(jpeg_encode(x, quality_factor, patches_to_image_luma, patches_to_image_chroma, x_shape), quality_factor, patches_to_image_luma, patches_to_image_chroma, x_shape)
 
       adjoint_observation_map = None
       H = None
+      y_test = observation_map(jnp.array(x))
+      plot_samples(y_test, image_size=config.data.image_size, num_channels=config.data.num_channels,
+                  fname="test2")
+      assert 0
 
     for cs_method in cs_methods:
       config.sampling.cs_method = cs_method
