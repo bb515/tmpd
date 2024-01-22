@@ -118,6 +118,74 @@ class FFHQDataset(VisionDataset):
         return img
 
 
+def setup():
+  # Tip: use CUDA_VISIBLE_DEVICES to restrict the devices visible to jax
+  # ... they must be all the same model of device for pmap to work
+  num_devices =  int(jax.local_device_count()) if config.eval.pmap else 1
+
+  # Create directory to eval_folder
+  eval_dir = os.path.join(workdir, eval_folder)
+  tf.io.gfile.makedirs(eval_dir)
+
+  rng = random.PRNGKey(config.seed + 1)
+
+  # Initialize model
+  rng, model_rng = random.split(rng)
+  score_model, init_model_state, initial_params = mutils.init_model(model_rng, config, num_devices)
+  optimizer = losses.get_optimizer(config).create(initial_params)
+  state = mutils.State(step=0, optimizer=optimizer, lr=config.optim.lr,
+                       model_state=init_model_state,
+                       ema_rate=config.model.ema_rate,
+                       params_ema=initial_params,
+                       rng=rng)  # pytype: disable=wrong-keyword-args
+  checkpoint_dir = workdir
+  cs_methods, sde = get_sde(config)
+
+  # Create data normalizer and its inverse
+  # scaler = datasets.get_data_scaler(config)
+  inverse_scaler = datasets.get_data_inverse_scaler(config)
+
+  # Get model state from checkpoint file
+  ckpt = config.eval.begin_ckpt
+  ckpt_filename = os.path.join(checkpoint_dir, "checkpoint_{}".format(ckpt))
+  if not tf.io.gfile.exists(ckpt_filename):
+    raise FileNotFoundError("{} does not exist".format(ckpt_filename))
+
+  state = checkpoints.restore_checkpoint(checkpoint_dir, state, step=ckpt)
+  epsilon_fn = mutils.get_epsilon_fn(
+    sde, score_model, state.params_ema, state.model_state, train=False, continuous=True)
+  score_fn = mutils.get_score_fn(
+    sde, score_model, state.params_ema, state.model_state, train=False, continuous=True)
+  batch_size = config.eval.batch_size
+  print("\nbatch_size={}".format(batch_size))
+  sampling_shape = (
+    config.eval.batch_size//num_devices,
+    config.data.image_size, config.data.image_size, config.data.num_channels)
+  print("sampling shape", sampling_shape)
+
+  # Create different random states for different hosts in a multi-host environment (e.g., TPU pods)
+  rng = random.fold_in(rng, jax.host_id())
+
+  return (num_devices,
+          eval_dir,
+          score_model,
+          init_model_state,
+          initial_params,
+          optimizer,
+          state,
+          checkpoint_dir,
+          cs_methods,
+          sde,
+          inverse_scaler,
+          scaler,
+          state,
+          epsilon_fn,
+          score_fn,
+          batch_size,
+          sampling_shape,
+          rng)
+
+
 def get_asset_sample(config):
   # transform = transforms.Compose([transforms.ToTensor(),
   #                                 transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
@@ -1030,52 +1098,25 @@ def jpeg(config, workdir, eval_folder="eval"):
 
 
 def inpainting(config, workdir, eval_folder="eval"):
-  # Tip: use CUDA_VISIBLE_DEVICES to restrict the devices visible to jax
-  # ... they must be all the same model of device for pmap to work
-  num_devices =  int(jax.local_device_count()) if config.eval.pmap else 1
+  (num_devices,
+   eval_dir,
+   score_model,
+   init_model_state,
+   initial_params,
+   optimizer,
+   state,
+   checkpoint_dir,
+   cs_methods,
+   sde,
+   inverse_scaler,
+   scaler,
+   state,
+   epsilon_fn,
+   score_fn,
+   batch_size,
+   sampling_shape,
+   rng) = setup()
 
-  # Create directory to eval_folder
-  eval_dir = os.path.join(workdir, eval_folder)
-  tf.io.gfile.makedirs(eval_dir)
-
-  rng = random.PRNGKey(config.seed + 1)
-
-  # Initialize model
-  rng, model_rng = random.split(rng)
-  score_model, init_model_state, initial_params = mutils.init_model(model_rng, config, num_devices)
-  optimizer = losses.get_optimizer(config).create(initial_params)
-  state = mutils.State(step=0, optimizer=optimizer, lr=config.optim.lr,
-                       model_state=init_model_state,
-                       ema_rate=config.model.ema_rate,
-                       params_ema=initial_params,
-                       rng=rng)  # pytype: disable=wrong-keyword-args
-  checkpoint_dir = workdir
-  cs_methods, sde = get_sde(config)
-
-  # Create data normalizer and its inverse
-  # scaler = datasets.get_data_scaler(config)
-  inverse_scaler = datasets.get_data_inverse_scaler(config)
-
-  # Get model state from checkpoint file
-  ckpt = config.eval.begin_ckpt
-  ckpt_filename = os.path.join(checkpoint_dir, "checkpoint_{}".format(ckpt))
-  if not tf.io.gfile.exists(ckpt_filename):
-    raise FileNotFoundError("{} does not exist".format(ckpt_filename))
-
-  state = checkpoints.restore_checkpoint(checkpoint_dir, state, step=ckpt)
-  epsilon_fn = mutils.get_epsilon_fn(
-    sde, score_model, state.params_ema, state.model_state, train=False, continuous=True)
-  score_fn = mutils.get_score_fn(
-    sde, score_model, state.params_ema, state.model_state, train=False, continuous=True)
-  batch_size = config.eval.batch_size
-  print("\nbatch_size={}".format(batch_size))
-  sampling_shape = (
-    config.eval.batch_size//num_devices,
-    config.data.image_size, config.data.image_size, config.data.num_channels)
-  print("sampling shape", sampling_shape)
-
-  # Create different random states for different hosts in a multi-host environment (e.g., TPU pods)
-  rng = random.fold_in(rng, jax.host_id())
   num_sampling_rounds = 2
 
   x = get_asset_sample(config)
