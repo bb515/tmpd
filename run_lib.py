@@ -234,7 +234,7 @@ def get_asset_sample(config):
   return ref_img
 
 
-def get_prior_sample(rng, score_fn, epsilon_fn, sde, inverse_scaler, sampling_shape, config, eval_folder):
+def get_prior_sample(rng, score_fn, epsilon_fn, sde, sampling_shape, config):
   if config.solver.outer_solver in unconditional_ddim_methods:
     outer_solver = get_ddim_chain(config, epsilon_fn)
   elif config.solver.outer_solver in unconditional_markov_methods:
@@ -254,8 +254,7 @@ def get_prior_sample(rng, score_fn, epsilon_fn, sde, inverse_scaler, sampling_sh
     rng, sample_rng = random.split(rng, 2)
 
   q_samples, _ = sampler(sample_rng)
-  # q_images = inverse_scaler(q_samples.copy())
-  q_samples = q_samples.reshape((config.eval.batch_size,) + sampling_shape[1:])
+  q_samples = q_samples.reshape(sampling_shape)
 
   return q_samples
 
@@ -759,7 +758,7 @@ def deblur(config, workdir, eval_folder="eval"):
 
   for i in range(num_sampling_rounds):
     x = get_eval_sample(scaler, inverse_scaler, config, eval_folder, num_devices)
-    # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, inverse_scaler, sampling_shape, config, eval_folder)
+    # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, sampling_shape, config)
     _, y, observation_map, _ = get_blur_observation(
         rng, x, config)
 
@@ -843,7 +842,7 @@ def super_resolution(config, workdir, eval_folder="eval"):
     method=method)
   for i in range(num_sampling_rounds):
     # x = get_eval_sample(scaler, config, num_devices)
-    # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, inverse_scaler, sampling_shape, config, eval_folder)
+    # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, sampling_shape, config)
     # _, y, *_ = get_superresolution_observation(
     #   rng, x, config,
     #   shape=shape,
@@ -977,7 +976,7 @@ def jpeg(config, workdir, eval_folder="eval"):
   # _, y, mask, num_obs = get_colorization_observation(rng, x, config, mask_name='half')
   for i in range(num_sampling_rounds):
     x = get_eval_sample(scaler, config, num_devices)
-    # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, inverse_scaler, sampling_shape, config, eval_folder)
+    # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, sampling_shape, config)
     _, y, (patches_to_image_luma, patches_to_image_chroma), num_obs = get_jpeg_observation(rng, x, config, quality_factor=quality_factor)
     plot_samples(y, image_size=config.data.image_size, num_channels=config.data.num_channels,
                  fname="test")
@@ -1075,19 +1074,19 @@ def inpainting(config, workdir, eval_folder="eval"):
   # _, y, mask, num_obs = get_colorization_observation(rng, x, config, mask_name='half')
   for i in range(num_sampling_rounds):
     # x = get_eval_sample(scaler, config, num_devices)
-    # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, inverse_scaler, sampling_shape, config, eval_folder)
+    # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, sampling_shape, config)
     # _, y, mask, num_obs = get_inpainting_observation(rng, x, config, mask_name='half')
     plot_samples(
       inverse_scaler(x.copy()),
       image_size=config.data.image_size,
       num_channels=config.data.num_channels,
-      fname=eval_folder + "/_{}_ground_{}_{}".format(
+      fname=eval_folder + "/_{}_{}_ground_{}".format(
         config.sampling.noise_std, config.data.dataset, i))
     plot_samples(
       inverse_scaler(y.copy()),
       image_size=config.data.image_size,
       num_channels=config.data.num_channels,
-      fname=eval_folder + "/_{}_observed_{}_{}".format(
+      fname=eval_folder + "/_{}_{}_observed_{}".format(
         config.sampling.noise_std, config.data.dataset, i))
     np.savez(eval_folder + "/{}_{}_ground_observed_{}.npz".format(
       config.sampling.noise_std, config.data.dataset, i),
@@ -1232,7 +1231,7 @@ def evaluate_inpainting(config,
   data_pools = data_stats["pool_3"]
   for i in range(num_sampling_rounds):
     x = get_eval_sample(scaler, config, num_devices)
-    # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, inverse_scaler, sampling_shape, config, eval_folder)
+    # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, sampling_shape, config)
     # x = get_asset_sample(config)
     x_flat, y, mask, num_obs = get_inpainting_observation(rng, x, config, mask_name='square')
     plot_samples(
@@ -1353,7 +1352,7 @@ def evaluate_super_resolution(config,
 
   for i in range(num_sampling_rounds):
     x = get_eval_sample(scaler, config, num_devices)
-    # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, inverse_scaler, sampling_shape, config, eval_folder)
+    # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, sampling_shape, config)
     # x = get_asset_sample(config)
     x_flat, y, *_ = get_superresolution_observation(
       rng, x, config,
@@ -1498,7 +1497,7 @@ def dps_search_inpainting(
     scale = float(f'{float(f"{scale:.3g}"):g}')
     config.solver.dps_scale_hyperparameter = scale
     x = get_eval_sample(scaler, config, num_devices)
-    # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, inverse_scaler, sampling_shape, config, eval_folder)
+    # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, sampling_shape, config)
     # x = get_asset_sample(config)
 
     x_flat, y, mask, num_obs = get_inpainting_observation(rng, x, config, mask_name='square')
@@ -1665,7 +1664,7 @@ def dps_search_super_resolution(config,
     scale = float(f'{float(f"{scale:.3g}"):g}')
     config.solver.dps_scale_hyperparameter = scale
     x = get_eval_sample(scaler, config, num_devices)
-    # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, inverse_scaler, sampling_shape, config, eval_folder)
+    # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, sampling_shape, config)
     # x = get_asset_sample(config)
 
     x_flat, y, mask, num_obs = get_superresolution_observation(
