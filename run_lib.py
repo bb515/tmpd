@@ -76,10 +76,10 @@ def _dps_method(config):
     else:
       # cs_method = 'chung2022scalarplus'
       cs_method = 'DPSSMLDplus'
-  return cs_method
+  return [cs_method]
 
 
-def _plot_ground_observed(x, y, inverse_scaler, config, i, search=False):
+def _plot_ground_observed(x, y, obs_shape, eval_folder, inverse_scaler, config, i, search=False):
   if search :
     eval_path = eval_folder + "/search_"
   else:
@@ -162,8 +162,8 @@ class FFHQDataset(VisionDataset):
         return img
 
 
-def _sample(config, workdir, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling_shape,
-            inverse_scaler, y, h, observation_map, adjoint_observation_map, rng,
+def _sample(config, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling_shape,
+            inverse_scaler, y, H, observation_map, adjoint_observation_map, rng,
             compute_metrics=False, search=False):
   for cs_method in cs_methods:
     config.sampling.cs_method = cs_method
@@ -200,6 +200,7 @@ def _sample(config, workdir, eval_folder, cs_methods, sde, epsilon_fn, score_fn,
       num_channels=config.data.num_channels,
       fname=eval_path)
     if compute_metrics:
+      data_pools, inception_model = compute_metrics
       np.savez(eval_path + ".npz", x=q_samples, y=y, noise_std=config.sampling.noise_std)
       save = False if search else True
       return compute_metrics_inner(config, cs_method, eval_path, x, q_samples, data_pools, inception_model,
@@ -254,25 +255,15 @@ def _setup(config, workdir, eval_folder):
 
   # Create different random states for different hosts in a multi-host environment (e.g., TPU pods)
   rng = random.fold_in(rng, jax.host_id())
-
   return (num_devices,
-          eval_dir,
-          score_model,
-          init_model_state,
-          initial_params,
-          optimizer,
-          state,
-          checkpoint_dir,
-          cs_methods,
-          sde,
-          inverse_scaler,
-          scaler,
-          state,
-          epsilon_fn,
-          score_fn,
-          batch_size,
-          sampling_shape,
-          rng)
+    cs_methods,
+    sde,
+    inverse_scaler,
+    scaler,
+    epsilon_fn,
+    score_fn,
+    sampling_shape,
+    rng)
 
 
 def get_asset_sample(config):
@@ -790,24 +781,8 @@ def compute_metrics(config, cs_methods, eval_folder):
 
 
 def deblur(config, workdir, eval_folder="eval"):
-  (num_devices,
-   eval_dir,
-   score_model,
-   init_model_state,
-   initial_params,
-   optimizer,
-   state,
-   checkpoint_dir,
-   cs_methods,
-   sde,
-   inverse_scaler,
-   scaler,
-   state,
-   epsilon_fn,
-   score_fn,
-   batch_size,
-   sampling_shape,
-   rng) = _setup(config, workdir, eval_folder)
+  (num_devices, cs_methods, sde, inverse_scaler, scaler, epsilon_fn, score_fn, sampling_shape, rng
+    ) = _setup(config, workdir, eval_folder)
 
   obs_shape = (config.data.image_size//2, config.data.image_size//2, config.data.num_channels)
   num_sampling_rounds = 2
@@ -818,7 +793,7 @@ def deblur(config, workdir, eval_folder="eval"):
     _, y, observation_map, _ = get_blur_observation(
         rng, x, config)
 
-    _plot_ground_observed(x.copy(), y.copy(), inverse_scaler, config, i)
+    _plot_ground_observed(x.copy(), y.copy(), obs_shape, eval_folder, inverse_scaler, config, i)
 
     print(observation_map)
     assert 0
@@ -855,25 +830,10 @@ def deblur(config, workdir, eval_folder="eval"):
 
 
 def super_resolution(config, workdir, eval_folder="eval"):
-  (num_devices,
-   eval_dir,
-   score_model,
-   init_model_state,
-   initial_params,
-   optimizer,
-   state,
-   checkpoint_dir,
-   cs_methods,
-   sde,
-   inverse_scaler,
-   scaler,
-   state,
-   epsilon_fn,
-   score_fn,
-   batch_size,
-   sampling_shape,
-   rng) = _setup(config, workdir, eval_folder)
-  shape=(
+  (_, cs_methods, sde, inverse_scaler, scaler, epsilon_fn, score_fn, sampling_shape, rng
+    ) = _setup(config, workdir, eval_folder)
+
+  obs_shape=(
     config.eval.batch_size, config.data.image_size//4, config.data.image_size//4, config.data.num_channels)
   method='nearest'  # 'bicubic'
   num_sampling_rounds = 3
@@ -881,7 +841,7 @@ def super_resolution(config, workdir, eval_folder="eval"):
   x = get_asset_sample(config)
   _, y, *_ = get_superresolution_observation(
     rng, x, config,
-    shape=shape,
+    shape=obs_shape,
     method=method)
   for i in range(num_sampling_rounds):
     # x = get_eval_sample(scaler, config, num_devices)
@@ -891,15 +851,15 @@ def super_resolution(config, workdir, eval_folder="eval"):
     #   shape=shape,
     #   method=method)
 
-    _plot_ground_observed(x.copy(), y.copy(), inverse_scaler, config, i)
+    _plot_ground_observed(x.copy(), y.copy(), obs_shape, eval_folder, inverse_scaler, config, i)
 
     def observation_map(x):
       x = x.reshape(sampling_shape[1:])
-      y = jax.image.resize(x, shape[1:], method)
+      y = jax.image.resize(x, obs_shape[1:], method)
       return y.flatten()
 
     def adjoint_observation_map(y):
-      y = y.reshape(shape[1:])
+      y = y.reshape(obs_shape[1:])
       x = jax.image.resize(y, sampling_shape[1:], method)
       return x.flatten()
 
@@ -978,24 +938,8 @@ def super_resolution(config, workdir, eval_folder="eval"):
 
 
 def jpeg(config, workdir, eval_folder="eval"):
-  (num_devices,
-   eval_dir,
-   score_model,
-   init_model_state,
-   initial_params,
-   optimizer,
-   state,
-   checkpoint_dir,
-   cs_methods,
-   sde,
-   inverse_scaler,
-   scaler,
-   state,
-   epsilon_fn,
-   score_fn,
-   batch_size,
-   sampling_shape,
-   rng) = _setup(config, workdir, eval_folder)
+  (num_devices, cs_methods, sde, inverse_scaler, scaler, epsilon_fn, score_fn, sampling_shape, rng
+    ) = _setup(config, workdir, eval_folder)
 
   num_sampling_rounds = 2
   quality_factor = 75.
@@ -1010,7 +954,7 @@ def jpeg(config, workdir, eval_folder="eval"):
     plot_samples(y, image_size=config.data.image_size, num_channels=config.data.num_channels,
                  fname="test")
 
-    _plot_ground_observed(x.copy(), y.copy(), inverse_scaler, config, i)
+    _plot_ground_observed(x.copy(), y.copy(), x.shape, eval_folder, inverse_scaler, config, i)
 
     if 'plus' not in config.sampling.cs_method:
       raise ValueError("Nonlinear observation map is not compatible.")
@@ -1033,24 +977,8 @@ def jpeg(config, workdir, eval_folder="eval"):
 
 
 def inpainting(config, workdir, eval_folder="eval"):
-  (num_devices,
-   eval_dir,
-   score_model,
-   init_model_state,
-   initial_params,
-   optimizer,
-   state,
-   checkpoint_dir,
-   cs_methods,
-   sde,
-   inverse_scaler,
-   scaler,
-   state,
-   epsilon_fn,
-   score_fn,
-   batch_size,
-   sampling_shape,
-   rng) = _setup(config, workdir, eval_folder)
+  (_, cs_methods, sde, inverse_scaler, scaler, epsilon_fn, score_fn, sampling_shape, rng
+    ) = _setup(config, workdir, eval_folder)
 
   num_sampling_rounds = 2
 
@@ -1062,7 +990,7 @@ def inpainting(config, workdir, eval_folder="eval"):
     # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, sampling_shape, config)
     # _, y, mask, num_obs = get_inpainting_observation(rng, x, config, mask_name='half')
 
-    _plot_ground_observed(x.copy(), y.copy(), inverse_scaler, config, i)
+    _plot_ground_observed(x.copy(), y.copy(), x.shape, eval_folder, inverse_scaler, config, i)
 
     if 'plus' not in config.sampling.cs_method:
       logging.warning(
@@ -1092,9 +1020,8 @@ def inpainting(config, workdir, eval_folder="eval"):
       adjoint_observation_map = None
       H = None
 
-    _sample(
-      config, workdir, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling_shape,
-      inverse_scaler, y, H, observation_map, adjoint_observation_map, rng)
+    _sample(config, workdir, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling_shape,
+           inverse_scaler, y, H, observation_map, adjoint_observation_map, rng)
 
 
 def sample(config,
@@ -1173,24 +1100,8 @@ def evaluate_inpainting(config,
     eval_folder: The subfolder for storing evaluation results. Default to
       "eval".
   """
-  (num_devices,
-   eval_dir,
-   score_model,
-   init_model_state,
-   initial_params,
-   optimizer,
-   state,
-   checkpoint_dir,
-   cs_methods,
-   sde,
-   inverse_scaler,
-   scaler,
-   state,
-   epsilon_fn,
-   score_fn,
-   batch_size,
-   sampling_shape,
-   rng) = _setup(config, workdir, eval_folder)
+  (num_devices, cs_methods, sde, inverse_scaler, scaler, epsilon_fn, score_fn, sampling_shape, rng
+    ) = _setup(config, workdir, eval_folder)
 
   num_sampling_rounds = 2
 
@@ -1200,13 +1111,14 @@ def evaluate_inpainting(config,
   # Load pre-computed dataset statistics.
   data_stats = load_dataset_stats(config)
   data_pools = data_stats["pool_3"]
+
   for i in range(num_sampling_rounds):
     x = get_eval_sample(scaler, config, num_devices)
     # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, sampling_shape, config)
     # x = get_asset_sample(config)
-    x_flat, y, mask, num_obs = get_inpainting_observation(rng, x, config, mask_name='square')
+    _, y, mask, num_obs = get_inpainting_observation(rng, x, config, mask_name='square')
 
-    _plot_ground_observed(x.copy(), y.copy(), inverse_scaler, config, i)
+    _plot_ground_observed(x.copy(), y.copy(), x.shape, eval_folder, inverse_scaler, config, i)
 
     if 'plus' not in config.sampling.cs_method:
       logging.warning(
@@ -1231,7 +1143,8 @@ def evaluate_inpainting(config,
       H = None
 
     _sample(config, workdir, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling_shape,
-            inverse_scaler, y, H, observation_map, adjoint_observation_map, rng, compute_metrics=True)
+           inverse_scaler, y, H, observation_map, adjoint_observation_map, rng,
+            compute_metrics=(x, data_pools, inception_model))
 
   compute_metrics(config, cs_methods, eval_folder)
 
@@ -1247,24 +1160,8 @@ def evaluate_super_resolution(config,
     eval_folder: The subfolder for storing evaluation results. Default to
       "eval".
   """
-  (num_devices,
-   eval_dir,
-   score_model,
-   init_model_state,
-   initial_params,
-   optimizer,
-   state,
-   checkpoint_dir,
-   cs_methods,
-   sde,
-   inverse_scaler,
-   scaler,
-   state,
-   epsilon_fn,
-   score_fn,
-   batch_size,
-   sampling_shape,
-   rng) = _setup(config, workdir, eval_folder)
+  (num_devices, cs_methods, sde, inverse_scaler, scaler, epsilon_fn, score_fn, sampling_shape, rng
+    ) = _setup(config, workdir, eval_folder)
 
   # Use inceptionV3 for images with resolution higher than 256.
   inceptionv3 = config.data.image_size >= 256
@@ -1273,7 +1170,7 @@ def evaluate_super_resolution(config,
   data_stats = load_dataset_stats(config)
   data_pools = data_stats["pool_3"]
 
-  shape=(config.eval.batch_size, config.data.image_size//4, config.data.image_size//4, config.data.num_channels)
+  obs_shape=(config.eval.batch_size, config.data.image_size//4, config.data.image_size//4, config.data.num_channels)
   method='bicubic'  # 'bicubic'
   num_sampling_rounds = 6
 
@@ -1281,26 +1178,28 @@ def evaluate_super_resolution(config,
     x = get_eval_sample(scaler, config, num_devices)
     # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, sampling_shape, config)
     # x = get_asset_sample(config)
-    x_flat, y, *_ = get_superresolution_observation(
+    _, y, *_ = get_superresolution_observation(
       rng, x, config,
-      shape=shape,
+      shape=obs_shape,
       method=method)
 
-    _plot_ground_observed(x.copy(), y.copy(), inverse_scaler, config, i)
+    _plot_ground_observed(x.copy(), y.copy(), obs_shape, eval_folder, inverse_scaler, config, i)
 
     def observation_map(x):
       x = x.reshape(sampling_shape[1:])
-      y = jax.image.resize(x, shape[1:], method)
+      y = jax.image.resize(x, obs_shape[1:], method)
       return y.flatten()
 
     def adjoint_observation_map(y):
-      y = y.reshape(shape[1:])
+      y = y.reshape(obs_shape[1:])
       x = jax.image.resize(y, sampling_shape[1:], method)
       return x.flatten()
 
     H = None
+
     _sample(config, workdir, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling_shape,
-            inverse_scaler, y, h, observation_map, adjoint_observation_map, rng, compute_metrics=True)
+           inverse_scaler, y, H, observation_map, adjoint_observation_map, rng,
+            compute_metrics=(x, data_pools, inception_model))
 
   compute_metrics(config, cs_methods, eval_folder)
 
@@ -1317,26 +1216,10 @@ def dps_search_inpainting(
     workdir,
     eval_folder="eval"):
 
-  (num_devices,
-   eval_dir,
-   score_model,
-   init_model_state,
-   initial_params,
-   optimizer,
-   state,
-   checkpoint_dir,
-   cs_methods,
-   sde,
-   inverse_scaler,
-   scaler,
-   state,
-   epsilon_fn,
-   score_fn,
-   batch_size,
-   sampling_shape,
-   rng) = sde(config, workdir, eval_folder)
+  (num_devices, cs_methods, sde, inverse_scaler, scaler, epsilon_fn, score_fn, sampling_shape, rng
+    ) = _setup(config, workdir, eval_folder)
 
-  cs_method = _dps_method(config)
+  cs_methods = _dps_method(config)
 
   num_sampling_rounds = 10
 
@@ -1365,9 +1248,10 @@ def dps_search_inpainting(
     # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, sampling_shape, config)
     # x = get_asset_sample(config)
 
-    x_flat, y, mask, num_obs = get_inpainting_observation(rng, x, config, mask_name='square')
+    _, y, mask, num_obs = get_inpainting_observation(rng, x, config, mask_name='square')
 
-    _plot_ground_observed(x.copy(), y.copy(), inverse_scaler, config, i, search=True)
+    _plot_ground_observed(x.copy(), y.copy(), x.shape, eval_folder, inverse_scaler, config, 0,
+                          search=True)
 
     if 'plus' not in config.sampling.cs_method and mask:
       logging.warning(
@@ -1392,8 +1276,8 @@ def dps_search_inpainting(
 
     (psnr_mean, psnr_std), (lpips_mean, lpips_std), (mse_mean, mse_std), (ssim_mean, ssim_std) = _sample(
       config, workdir, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling_shape,
-      inverse_scaler, y, h, observation_map, adjoint_observation_map, rng,
-      compute_metrics=True, search=True)
+      inverse_scaler, y, H, observation_map, adjoint_observation_map, rng,
+      compute_metrics=(x, data_pools, inception_model), search=True)
 
     psnr_means.append(psnr_mean)
     psnr_stds.append(psnr_std)
@@ -1423,26 +1307,10 @@ def dps_search_inpainting(
 def dps_search_super_resolution(config,
              workdir,
              eval_folder="eval"):
-  (num_devices,
-   eval_dir,
-   score_model,
-   init_model_state,
-   initial_params,
-   optimizer,
-   state,
-   checkpoint_dir,
-   cs_methods,
-   sde,
-   inverse_scaler,
-   scaler,
-   state,
-   epsilon_fn,
-   score_fn,
-   batch_size,
-   sampling_shape,
-   rng) = _setup(config, workdir, eval_folder)
+  (num_devices, cs_methods, sde, inverse_scaler, scaler, epsilon_fn, score_fn, sampling_shape, rng
+    ) = _setup(config, workdir, eval_folder)
 
-  cs_method = _dps_method(config)
+  cs_methods = _dps_method(config)
 
   num_sampling_rounds = 10
 
@@ -1463,7 +1331,7 @@ def dps_search_super_resolution(config,
   mse_means = []
   mse_stds = []
 
-  shape = (config.eval.batch_size, config.data.image_size//4, config.data.image_size//4, config.data.num_channels)
+  obs_shape = (config.eval.batch_size, config.data.image_size//4, config.data.image_size//4, config.data.num_channels)
   method = 'bicubic'
   for scale in dps_hyperparameters:
     # round to 3 sig fig
@@ -1473,20 +1341,21 @@ def dps_search_super_resolution(config,
     # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, sampling_shape, config)
     # x = get_asset_sample(config)
 
-    x_flat, y, mask, num_obs = get_superresolution_observation(
+    _, y, *_ = get_superresolution_observation(
       rng, x, config,
-      shape=shape,
+      shape=obs_shape,
       method=method)
 
-    _plot_ground_observed(x.copy(), y.copy(), inverse_scaler, config, i, search=True)
+    _plot_ground_observed(x.copy(), y.copy(), obs_shape, eval_folder, inverse_scaler, config, 0,
+                          search=True)
 
     def observation_map(x):
       x = x.reshape(sampling_shape[1:])
-      y = jax.image.resize(x, shape[1:], method)
+      y = jax.image.resize(x, obs_shape[1:], method)
       return y.flatten()
 
     def adjoint_observation_map(y):
-      y = y.reshape(shape[1:])
+      y = y.reshape(obs_shape[1:])
       x = jax.image.resize(y, sampling_shape[1:], method)
       return x.flatten()
 
@@ -1494,8 +1363,8 @@ def dps_search_super_resolution(config,
 
     (psnr_mean, psnr_std), (lpips_mean, lpips_std), (mse_mean, mse_std), (ssim_mean, ssim_std) = _sample(
       config, workdir, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling_shape,
-      inverse_scaler, y, h, observation_map, adjoint_observation_map, rng,
-      compute_metrics=True, search=True)
+      inverse_scaler, y, H, observation_map, adjoint_observation_map, rng,
+      compute_metrics=(x, data_pools, inception_model), search=True)
 
     psnr_means.append(psnr_mean)
     psnr_stds.append(psnr_std)
