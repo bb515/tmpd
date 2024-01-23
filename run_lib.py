@@ -162,7 +162,7 @@ class FFHQDataset(VisionDataset):
         return img
 
 
-def _sample(config, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling_shape,
+def _sample(i, config, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling_shape,
             inverse_scaler, y, H, observation_map, adjoint_observation_map, rng,
             compute_metrics=False, search=False):
   for cs_method in cs_methods:
@@ -188,7 +188,7 @@ def _sample(config, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling
     print("{}: {}s".format(cs_method, sample_time))
     if search:
       eval_file = "search_{}_{}_{}_{}".format(
-        config.sampling.noise_std, config.data.dataset, config.sampling.cs_method.lower(), scale)
+        config.sampling.noise_std, config.data.dataset, config.sampling.cs_method.lower(), i)
     else:
       eval_file = "{}_{}_{}_{}".format(
         config.sampling.noise_std, config.data.dataset, config.sampling.cs_method.lower(), i)
@@ -972,23 +972,23 @@ def jpeg(config, workdir, eval_folder="eval"):
                   fname="test2")
       assert 0
 
-    _sample(config, workdir, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling_shape,
+    _sample(i, config, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling_shape,
            inverse_scaler, y, H, observation_map, adjoint_observation_map, rng)
 
 
 def inpainting(config, workdir, eval_folder="eval"):
-  (_, cs_methods, sde, inverse_scaler, scaler, epsilon_fn, score_fn, sampling_shape, rng
+  (num_devices, cs_methods, sde, inverse_scaler, scaler, epsilon_fn, score_fn, sampling_shape, rng
     ) = _setup(config, workdir, eval_folder)
 
   num_sampling_rounds = 2
 
-  x = get_asset_sample(config)
-  _, y, mask, num_obs = get_inpainting_observation(rng, x, config, mask_name='square')
+  # x = get_asset_sample(config)
+  # _, y, mask, num_obs = get_inpainting_observation(rng, x, config, mask_name='square')
   # _, y, mask, num_obs = get_colorization_observation(rng, x, config, mask_name='half')
   for i in range(num_sampling_rounds):
-    # x = get_eval_sample(scaler, config, num_devices)
+    x = get_eval_sample(scaler, config, num_devices)
     # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, sampling_shape, config)
-    # _, y, mask, num_obs = get_inpainting_observation(rng, x, config, mask_name='half')
+    _, y, mask, num_obs = get_inpainting_observation(rng, x, config, mask_name='half')
 
     _plot_ground_observed(x.copy(), y.copy(), x.shape, eval_folder, inverse_scaler, config, i)
 
@@ -1020,8 +1020,9 @@ def inpainting(config, workdir, eval_folder="eval"):
       adjoint_observation_map = None
       H = None
 
-    _sample(config, workdir, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling_shape,
-           inverse_scaler, y, H, observation_map, adjoint_observation_map, rng)
+    print(cs_methods)
+    _sample(i, config, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling_shape,
+            inverse_scaler, y, H, observation_map, adjoint_observation_map, rng)
 
 
 def sample(config,
@@ -1142,7 +1143,7 @@ def evaluate_inpainting(config,
       adjoint_observation_map = None
       H = None
 
-    _sample(config, workdir, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling_shape,
+    _sample(i, config, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling_shape,
            inverse_scaler, y, H, observation_map, adjoint_observation_map, rng,
             compute_metrics=(x, data_pools, inception_model))
 
@@ -1197,7 +1198,7 @@ def evaluate_super_resolution(config,
 
     H = None
 
-    _sample(config, workdir, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling_shape,
+    _sample(i, config, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling_shape,
            inverse_scaler, y, H, observation_map, adjoint_observation_map, rng,
             compute_metrics=(x, data_pools, inception_model))
 
@@ -1275,7 +1276,7 @@ def dps_search_inpainting(
       H = None
 
     (psnr_mean, psnr_std), (lpips_mean, lpips_std), (mse_mean, mse_std), (ssim_mean, ssim_std) = _sample(
-      config, workdir, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling_shape,
+      scale, config, workdir, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling_shape,
       inverse_scaler, y, H, observation_map, adjoint_observation_map, rng,
       compute_metrics=(x, data_pools, inception_model), search=True)
 
@@ -1362,7 +1363,7 @@ def dps_search_super_resolution(config,
     H = None
 
     (psnr_mean, psnr_std), (lpips_mean, lpips_std), (mse_mean, mse_std), (ssim_mean, ssim_std) = _sample(
-      config, workdir, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling_shape,
+      scale, config, workdir, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling_shape,
       inverse_scaler, y, H, observation_map, adjoint_observation_map, rng,
       compute_metrics=(x, data_pools, inception_model), search=True)
 
