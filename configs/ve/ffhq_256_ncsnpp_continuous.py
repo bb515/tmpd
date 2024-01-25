@@ -36,8 +36,9 @@ def get_config():
   data = config.data
   data.dataset = 'FFHQ'
   data.image_size = 256
-  # data.tfrecords_path =
-
+  # NOTE: It has to be a name of a tfrecords file
+  # NOTE: The ffhq-rn record stands for 2**n image_size
+  data.tfrecords_path = './assets/ffhq/ffhq-r08.tfrecords'
 
   # model
   model = config.model

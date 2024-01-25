@@ -85,6 +85,7 @@ def _plot_ground_observed(x, y, obs_shape, eval_folder, inverse_scaler, config, 
   else:
     eval_path = eval_folder + "/_"
 
+  # TODO: should not name outer_solver if sample taken from validation set
   plot_samples(
     inverse_scaler(x),
     image_size=config.data.image_size,
@@ -830,6 +831,18 @@ def deblur(config, workdir, eval_folder="eval"):
 
 
 def super_resolution(config, workdir, eval_folder="eval"):
+  inverse_scaler = lambda x: x
+  x = get_eval_sample(lambda x : x, config, 1)
+  print(x.shape)
+
+  plot_samples(
+    x,
+    image_size=2**8,
+    num_channels=3,
+    fname="./"+ "{}_ground_{}_{}".format(
+      config.data.dataset, config.solver.outer_solver, 0))
+  assert 0
+
   (_, cs_methods, sde, inverse_scaler, scaler, epsilon_fn, score_fn, sampling_shape, rng
     ) = _setup(config, workdir, eval_folder)
 
