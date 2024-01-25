@@ -321,6 +321,18 @@ def get_eval_sample(scaler, config, num_devices):
   return eval_batch['image'][0]
 
 
+def get_eval_dataset(scaler, config, num_devices):
+  _, eval_ds, _ = datasets.get_dataset(num_devices,
+                                       config,
+                                       uniform_dequantization=config.data.uniform_dequantization,
+                                       evaluation=True)
+  # get iterator over dataste
+  # eval_iter = iter(eval_ds)
+  # batch = next(eval_iter)
+  # eval_batch = jax.tree_map(lambda x: scaler(x._numpy()), batch)  # pylint: disable=protected-access
+  return eval_ds
+
+
 def get_sde(config):
   # Setup SDEs
   if config.training.sde.lower() == 'vpsde':

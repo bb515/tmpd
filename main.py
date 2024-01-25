@@ -25,11 +25,6 @@ flags.mark_flags_as_required(["workdir", "config", "mode"])
 def main(argv):
     tf.config.experimental.set_visible_devices([], "GPU")
     os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
-    scaler = lambda x: x
-    num_devices = 1
-    run_lib.get_eval_sample(scaler, FLAGS.config, num_devices)
-    assert 0
-
     if FLAGS.mode == "sample":
         run_lib.sample(FLAGS.config, FLAGS.workdir, FLAGS.eval_folder)
     elif FLAGS.mode == "eval_from_file":
