@@ -380,8 +380,10 @@ class DPSSMLD(SMLD):
     super().__init__(score, sigma, ts)
     self.y = y
     self.scale = scale
-    self.likelihood_score = self.get_likelihood_score(self.get_estimate_x_0(observation_map))
-    self.likelihood_score_vmap = self.get_likelihood_score_vmap(self.get_estimate_x_0_vmap(observation_map))
+    self.likelihood_score = self.get_likelihood_score(
+      self.get_estimate_x_0(observation_map, clip=True))
+    self.likelihood_score_vmap = self.get_likelihood_score_vmap(
+      self.get_estimate_x_0_vmap(observation_map, clip=True))
 
   def get_likelihood_score_vmap(self, estimate_h_x_0_vmap):
     def l2_norm(x, t, timestep, y):
@@ -407,7 +409,13 @@ class DPSSMLD(SMLD):
     # ls, score = self.likelihood_score(x, t, timestep, self.y)
     ls, score = self.likelihood_score_vmap(x, t, timestep, self.y)
     x_mean, std = self.posterior(score, x, timestep)
-    x_mean -= self.scale * ls  # DPS
+
+    sigma = self.discrete_sigmas[timestep]
+    sigma_prev = self.discrete_sigmas_prev[timestep]
+    x_mean = x_mean - batch_mul(1 - sigma_prev**2 / sigma**2, self.scale * ls)
+    # x_mean = x_mean - batch_mul(sigma**2, self.scale * ls)
+    # Since DPS was empirically derived for VP SDE, the scaling in their paper will not work for VE SDE
+    # x_mean = x_mean - self.scale * ls  # Not the correct scaling for VE
     z = random.normal(rng, x.shape)
     x = x_mean + batch_mul(std, z)
     return x, x_mean
@@ -422,8 +430,10 @@ class DPSDDPM(DDPM):
     super().__init__(score, beta, ts)
     self.y = y
     self.scale = scale
-    self.likelihood_score = self.get_likelihood_score(self.get_estimate_x_0(observation_map))
-    self.likelihood_score_vmap = self.get_likelihood_score_vmap(self.get_estimate_x_0_vmap(observation_map))
+    self.likelihood_score = self.get_likelihood_score(
+      self.get_estimate_x_0(observation_map, clip=True))
+    self.likelihood_score_vmap = self.get_likelihood_score_vmap(
+      self.get_estimate_x_0_vmap(observation_map, clip=True))
 
   def get_likelihood_score_vmap(self, estimate_h_x_0_vmap):
     def l2_norm(x, t, timestep, y):
@@ -492,11 +502,11 @@ class KPDDPM(DDPM):
     m = self.sqrt_alphas_cumprod[timestep]
     v = self.sqrt_1m_alphas_cumprod[timestep]**2
     ratio = v / m
-    x_dash = self.batch_analysis_vmap(self.y, x, t, timestep, ratio)
+    x_0 = self.batch_analysis_vmap(self.y, x, t, timestep, ratio)
     alpha = self.alphas[timestep]
     m_prev = self.sqrt_alphas_cumprod_prev[timestep]
     v_prev = self.sqrt_1m_alphas_cumprod_prev[timestep]**2
-    x_mean = batch_mul(jnp.sqrt(alpha) * v_prev / v, x) + batch_mul(m_prev * beta / v, x_dash)
+    x_mean = batch_mul(jnp.sqrt(alpha) * v_prev / v, x) + batch_mul(m_prev * beta / v, x_0)
     std = jnp.sqrt(beta * v_prev / v)
     return x_mean, std
 

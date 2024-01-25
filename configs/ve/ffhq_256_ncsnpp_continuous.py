@@ -71,7 +71,7 @@ def get_config():
   config.seed = 2023
   sampling.cs_method = 'TMPD2023bvjpplus'
 
-  sampling.stack_samples = True
+  sampling.stack_samples = False
   sampling.noise_std = 0.05
   sampling.denoise = True
   sampling.inverse_scaler = None
@@ -104,6 +104,7 @@ def get_config():
 
   # superresolution 8bicubic
   # solver.dps_scale_hyperparameter = 1.0 # for noise_std=0.01
-  solver.dps_scale_hyperparameter = 0.5 # for noise_std=0.05
+  # solver.dps_scale_hyperparameter = 0.5 # for noise_std=0.05
+  solver.dps_scale_hyperparameter = 0.3 # for noise_std=0.05
   # solver.dps_scale_hyperparameter = 0.5  # for noise_std=0.1
   return config

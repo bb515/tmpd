@@ -81,7 +81,7 @@ def _dps_method(config):
 
 def _plot_ground_observed(x, y, obs_shape, eval_folder, inverse_scaler, config, i, search=False):
   if search :
-    eval_path = eval_folder + "/search_"
+    eval_path = eval_folder + "/search_{}_".format(i)
   else:
     eval_path = eval_folder + "/_"
 
@@ -201,7 +201,7 @@ def _sample(i, config, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampl
       num_channels=config.data.num_channels,
       fname=eval_path)
     if compute_metrics:
-      data_pools, inception_model = compute_metrics
+      x, data_pools, inception_model = compute_metrics
       np.savez(eval_path + ".npz", x=q_samples, y=y, noise_std=config.sampling.noise_std)
       save = False if search else True
       return compute_metrics_inner(config, cs_method, eval_path, x, q_samples, data_pools, inception_model,
@@ -324,8 +324,8 @@ def get_eval_sample(scaler, config, num_devices):
 def get_sde(config):
   # Setup SDEs
   if config.training.sde.lower() == 'vpsde':
-    beta = get_linear_beta_function(beta_min=config.model.beta_min, beta_max=config.model.beta_max)
-    sde = VP(beta)
+    beta, log_mean_coeff = get_linear_beta_function(beta_min=config.model.beta_min, beta_max=config.model.beta_max)
+    sde = VP(beta, log_mean_coeff)
     if 'plus' not in config.sampling.cs_method:
       # VP/DDPM Methods with matrix H
       cs_methods = [
@@ -366,10 +366,10 @@ def get_sde(config):
       cs_methods = [
                     # 'KPSMLDdiag',
                     # 'TMPD2023bvjpplus',
-                    'KPSMLDplus',
+                    # 'KPSMLDplus',
                     'DPSSMLDplus',
-                    'PiGDMVEplus',
-                    'KGDMVEplus',
+                    # 'PiGDMVEplus',
+                    # 'KGDMVEplus',
                     # 'chung2022scalarplus',  
                     # 'chung2022plus',  
                     # 'Song2023plus',
@@ -392,7 +392,7 @@ def get_jpeg_observation(rng, x, config, quality_factor=75.):
 
 
 def get_inpainting_observation(rng, x, config, mask_name='square'):
-  " mask_name in ['square', 'half', 'inverse_square', 'lorem3'"
+  "mask_name in ['square', 'half', 'inverse_square', 'lorem3'"
   x = flatten_vmap(x)
   mask, num_obs = get_mask(config.data.image_size, mask_name)
   y = x + random.normal(rng, x.shape) * config.sampling.noise_std
@@ -400,7 +400,7 @@ def get_inpainting_observation(rng, x, config, mask_name='square'):
   return x, y, mask, num_obs
 
 
-def get_colorization_observation(rng, x, config, mask_name='square'):
+def get_colorization_observation(rng, x, config):
   " "
   grayscale = jnp.array([0.299, 0.587, 0.114])
   grayscale = grayscale.reshape(1, 1, 1, -1)
@@ -408,7 +408,6 @@ def get_colorization_observation(rng, x, config, mask_name='square'):
   x = jnp.sum(x, axis=3)
   x = flatten_vmap(x)
   y = x + random.normal(rng, x.shape) * config.sampling.noise_std
-  # y = y * mask
   num_obs = x.size
   return x, y, grayscale, num_obs
 
@@ -843,7 +842,7 @@ def super_resolution(config, workdir, eval_folder="eval"):
       config.data.dataset, config.solver.outer_solver, 0))
   assert 0
 
-  (_, cs_methods, sde, inverse_scaler, scaler, epsilon_fn, score_fn, sampling_shape, rng
+  (num_devices, cs_methods, sde, inverse_scaler, scaler, epsilon_fn, score_fn, sampling_shape, rng
     ) = _setup(config, workdir, eval_folder)
 
   obs_shape=(
@@ -851,18 +850,21 @@ def super_resolution(config, workdir, eval_folder="eval"):
   method='nearest'  # 'bicubic'
   num_sampling_rounds = 3
 
-  x = get_asset_sample(config)
-  _, y, *_ = get_superresolution_observation(
-    rng, x, config,
-    shape=obs_shape,
-    method=method)
+  if config.data.dataset.lower() == 'ffhq':
+    x = get_asset_sample(config)
+    _, y, *_ = get_superresolution_observation(
+      rng, x, config,
+      shape=obs_shape,
+      method=method)
+
   for i in range(num_sampling_rounds):
-    # x = get_eval_sample(scaler, config, num_devices)
-    # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, sampling_shape, config)
-    # _, y, *_ = get_superresolution_observation(
-    #   rng, x, config,
-    #   shape=shape,
-    #   method=method)
+    if config.data.dataset.lower() != 'ffhq':
+      x = get_eval_sample(scaler, config, num_devices)
+      # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, sampling_shape, config)
+      _, y, *_ = get_superresolution_observation(
+        rng, x, config,
+        shape=obs_shape,
+        method=method)
 
     _plot_ground_observed(x.copy(), y.copy(), obs_shape, eval_folder, inverse_scaler, config, i)
 
@@ -957,13 +959,17 @@ def jpeg(config, workdir, eval_folder="eval"):
   num_sampling_rounds = 2
   quality_factor = 75.
 
-  # x = get_asset_sample(config)
-  # _, y, mask, num_obs = get_inpainting_observation(rng, x, config, mask_name='square')
-  # _, y, mask, num_obs = get_colorization_observation(rng, x, config, mask_name='half')
+  if config.data.dataset.lower() == 'ffhq':
+    x = get_asset_sample(config)
+    _, y, (patches_to_image_luma, patches_to_image_chroma), _ = get_jpeg_observation(
+      rng, x, config, quality_factor=quality_factor)
+
   for i in range(num_sampling_rounds):
-    x = get_eval_sample(scaler, config, num_devices)
-    # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, sampling_shape, config)
-    _, y, (patches_to_image_luma, patches_to_image_chroma), num_obs = get_jpeg_observation(rng, x, config, quality_factor=quality_factor)
+    if config.data.dataset.lower() != 'ffhq':
+      x = get_eval_sample(scaler, config, num_devices)
+      # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, sampling_shape, config)
+      _, y, (patches_to_image_luma, patches_to_image_chroma), _ = get_jpeg_observation(
+        rng, x, config, quality_factor=quality_factor)
     plot_samples(y, image_size=config.data.image_size, num_channels=config.data.num_channels,
                  fname="test")
 
@@ -995,13 +1001,17 @@ def inpainting(config, workdir, eval_folder="eval"):
 
   num_sampling_rounds = 2
 
-  # x = get_asset_sample(config)
-  # _, y, mask, num_obs = get_inpainting_observation(rng, x, config, mask_name='square')
-  # _, y, mask, num_obs = get_colorization_observation(rng, x, config, mask_name='half')
+  if config.data.dataset.lower() == 'ffhq':
+    x = get_asset_sample(config)
+    _, y, mask, num_obs = get_inpainting_observation(rng, x, config, mask_name='square')
+    # _, y, mask, num_obs = get_colorization_observation(rng, x, config)
+
   for i in range(num_sampling_rounds):
-    x = get_eval_sample(scaler, config, num_devices)
-    # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, sampling_shape, config)
-    _, y, mask, num_obs = get_inpainting_observation(rng, x, config, mask_name='half')
+    if config.data.dataset.lower() != 'ffhq':
+      x = get_eval_sample(scaler, config, num_devices)
+      # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, sampling_shape, config)
+      _, y, mask, num_obs = get_inpainting_observation(rng, x, config, mask_name='half')
+      # _, y, mask, num_obs = get_colorization_observation(rng, x, config)
 
     _plot_ground_observed(x.copy(), y.copy(), x.shape, eval_folder, inverse_scaler, config, i)
 
@@ -1126,11 +1136,17 @@ def evaluate_inpainting(config,
   data_stats = load_dataset_stats(config)
   data_pools = data_stats["pool_3"]
 
-  for i in range(num_sampling_rounds):
-    x = get_eval_sample(scaler, config, num_devices)
-    # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, sampling_shape, config)
-    # x = get_asset_sample(config)
+  if config.data.dataset.lower() == 'ffhq':
+    x = get_asset_sample(config)
     _, y, mask, num_obs = get_inpainting_observation(rng, x, config, mask_name='square')
+    # _, y, mask, num_obs = get_colorization_observation(rng, x, config)
+
+  for i in range(num_sampling_rounds):
+    if config.data.dataset.lower() != 'ffhq':
+      x = get_eval_sample(scaler, config, num_devices)
+      # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, sampling_shape, config)
+      _, y, mask, num_obs = get_inpainting_observation(rng, x, config, mask_name='square')
+      # _, y, mask, num_obs = get_colorization_observation(rng, x, config)
 
     _plot_ground_observed(x.copy(), y.copy(), x.shape, eval_folder, inverse_scaler, config, i)
 
@@ -1188,14 +1204,21 @@ def evaluate_super_resolution(config,
   method='bicubic'  # 'bicubic'
   num_sampling_rounds = 6
 
-  for i in range(num_sampling_rounds):
-    x = get_eval_sample(scaler, config, num_devices)
-    # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, sampling_shape, config)
-    # x = get_asset_sample(config)
+  if config.data.dataset.lower() == 'ffhq':
+    x = get_asset_sample(config)
     _, y, *_ = get_superresolution_observation(
       rng, x, config,
       shape=obs_shape,
       method=method)
+
+  for i in range(num_sampling_rounds):
+    if config.data.dataset.lower() != 'ffhq':
+      x = get_eval_sample(scaler, config, num_devices)
+      # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, sampling_shape, config)
+      _, y, *_ = get_superresolution_observation(
+        rng, x, config,
+        shape=obs_shape,
+        method=method)
 
     _plot_ground_observed(x.copy(), y.copy(), obs_shape, eval_folder, inverse_scaler, config, i)
 
@@ -1254,15 +1277,21 @@ def dps_search_inpainting(
   mse_means = []
   mse_stds = []
 
+  if config.data.dataset.lower() == 'ffhq':
+    x = get_asset_sample(config)
+    _, y, mask, num_obs = get_inpainting_observation(rng, x, config, mask_name='square')
+    # _, y, mask, num_obs = get_colorization_observation(rng, x, config)
+
   for scale in dps_hyperparameters:
     # round to 3 sig fig
     scale = float(f'{float(f"{scale:.3g}"):g}')
     config.solver.dps_scale_hyperparameter = scale
-    x = get_eval_sample(scaler, config, num_devices)
-    # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, sampling_shape, config)
-    # x = get_asset_sample(config)
 
-    _, y, mask, num_obs = get_inpainting_observation(rng, x, config, mask_name='square')
+    if config.data.dataset.lower() != 'ffhq':
+      x = get_eval_sample(scaler, config, num_devices)
+      # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, sampling_shape, config)
+      _, y, mask, num_obs = get_inpainting_observation(rng, x, config, mask_name='square')
+      # _, y, mask, num_obs = get_colorization_observation(rng, x, config)
 
     _plot_ground_observed(x.copy(), y.copy(), x.shape, eval_folder, inverse_scaler, config, 0,
                           search=True)
@@ -1289,7 +1318,7 @@ def dps_search_inpainting(
       H = None
 
     (psnr_mean, psnr_std), (lpips_mean, lpips_std), (mse_mean, mse_std), (ssim_mean, ssim_std) = _sample(
-      scale, config, workdir, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling_shape,
+      scale, config, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling_shape,
       inverse_scaler, y, H, observation_map, adjoint_observation_map, rng,
       compute_metrics=(x, data_pools, inception_model), search=True)
 
@@ -1347,18 +1376,28 @@ def dps_search_super_resolution(config,
 
   obs_shape = (config.eval.batch_size, config.data.image_size//4, config.data.image_size//4, config.data.num_channels)
   method = 'bicubic'
-  for scale in dps_hyperparameters:
-    # round to 3 sig fig
-    scale = float(f'{float(f"{scale:.3g}"):g}')
-    config.solver.dps_scale_hyperparameter = scale
-    x = get_eval_sample(scaler, config, num_devices)
-    # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, sampling_shape, config)
-    # x = get_asset_sample(config)
+  # obs_shape = (config.eval.batch_size, config.data.image_size//2, config.data.image_size//2, config.data.num_channels)
+  # method = 'nearest'
 
+  if config.data.dataset.lower() == 'ffhq':
+    x = get_asset_sample(config)
     _, y, *_ = get_superresolution_observation(
       rng, x, config,
       shape=obs_shape,
       method=method)
+
+  for scale in dps_hyperparameters:
+    if config.data.dataset.lower() != 'ffhq':
+      x = get_eval_sample(scaler, config, num_devices)
+      # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, sampling_shape, config)
+      _, y, *_ = get_superresolution_observation(
+        rng, x, config,
+        shape=obs_shape,
+        method=method)
+
+    # round to 3 sig fig
+    scale = float(f'{float(f"{scale:.3g}"):g}')
+    config.solver.dps_scale_hyperparameter = scale
 
     _plot_ground_observed(x.copy(), y.copy(), obs_shape, eval_folder, inverse_scaler, config, 0,
                           search=True)
@@ -1376,7 +1415,7 @@ def dps_search_super_resolution(config,
     H = None
 
     (psnr_mean, psnr_std), (lpips_mean, lpips_std), (mse_mean, mse_std), (ssim_mean, ssim_std) = _sample(
-      scale, config, workdir, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling_shape,
+      scale, config, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling_shape,
       inverse_scaler, y, H, observation_map, adjoint_observation_map, rng,
       compute_metrics=(x, data_pools, inception_model), search=True)
 

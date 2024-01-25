@@ -70,14 +70,15 @@ def get_config():
   sampling.cs_method = 'TMPD2023bvjpplus'
   # sampling.cs_method = 'TMPD2023bvjp'
 
-  sampling.noise_std = 0.01
+  sampling.stack_samples = False
+  sampling.noise_std = 0.05
   sampling.denoise = True
   sampling.innovation = True
   sampling.inverse_scaler = None
   eval = config.eval
   eval.begin_ckpt = 8  # 12
   eval.end_ckpt = 8  # 12
-  eval.batch_size = 1
+  eval.batch_size = 128
   eval.pmap = False
   solver = config.solver
   # solver.outer_solver = 'eulermaruyama'
