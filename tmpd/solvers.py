@@ -24,7 +24,6 @@ class STSL(DDIMVP):
     self.batch_adjoint_observation_map = vmap(adjoint_observation_map)
     self.batch_observation_map = vmap(observation_map)
     self.jacrev_vmap = vmap(jacrev(lambda x, t, timestep: self.estimate_h_x_0_vmap(x, t, timestep)[0]))
-    # self.axes = (0,) + tuple(range(len(shape) + 4)[2:]) + (1,)
     self.axes_vmap = tuple(range(len(shape) + 3)[1:]) + (0,)
     self.likelihood_strength = likelihood_strength
     self.scale = scale
@@ -81,7 +80,6 @@ class MPGD(DDIMVP):
     self.y = y
     self.noise_std = noise_std
     self.num_y = y.shape[1]
-    # self.axes = (0,) + tuple(range(len(shape) + 2)[2:]) + (1,)
     self.axes_vmap = tuple(range(len(shape) + 1)[1:]) + (0,)
 
   def get_likelihood_score_vmap(self, observation_map):
@@ -136,7 +134,6 @@ class KGDMVP(DDIMVP):
     self.observation_map = observation_map
     self.batch_observation_map = vmap(observation_map)
     self.jacrev_vmap = vmap(jacrev(lambda x, t, timestep: self.estimate_h_x_0_vmap(x, t, timestep)[0]))
-    # self.axes = (0,) + tuple(range(len(shape) + 2)[2:]) + (1,)
     self.axes_vmap = tuple(range(len(shape) + 1)[1:]) + (0,)
 
   def analysis(self, y, x, t, timestep, ratio):
@@ -195,7 +192,6 @@ class KGDMVE(DDIMVE):
     self.observation_map = observation_map
     self.batch_observation_map  = vmap(observation_map)
     self.jacrev_vmap = vmap(jacrev(lambda x, t, timestep: self.estimate_h_x_0_vmap(x, t, timestep)[0]))
-    # self.axes = (0,) + tuple(range(len(shape) + 2)[2:]) + (1,)
     self.axes_vmap = tuple(range(len(shape) + 1)[1:]) + (0,)
 
   def analysis(self, y, x, t, timestep, ratio):
@@ -234,8 +230,9 @@ class PiGDMVP(DDIMVP):
   """PiGDM Song et al. 2023. Markov chain using the DDIM Markov Chain or VP SDE."""
   def __init__(self, y, observation_map, noise_std, shape, model, data_variance=1.0, eta=0.0, beta=None, ts=None):
     super().__init__(model, eta, beta, ts)
-    self.estimate_h_x_0 = self.get_estimate_x_0(observation_map)
-    self.estimate_h_x_0_vmap = self.get_estimate_x_0_vmap(observation_map)
+    # This method requires clipping in order to remain (robustly, over all samples) numerically stable
+    self.estimate_h_x_0 = self.get_estimate_x_0(observation_map, clip=True)
+    self.estimate_h_x_0_vmap = self.get_estimate_x_0_vmap(observation_map, clip=True)
     self.batch_analysis_vmap = vmap(self.analysis)
     self.y = y
     self.noise_std = noise_std
@@ -244,7 +241,6 @@ class PiGDMVP(DDIMVP):
     self.observation_map = observation_map
     self.batch_observation_map = vmap(observation_map)
     self.jacrev_vmap = vmap(jacrev(lambda x, t, timestep: self.estimate_h_x_0_vmap(x, t, timestep)[0]))
-    # self.axes = (0,) + tuple(range(len(shape) + 4)[2:]) + (1,)
     self.axes_vmap = tuple(range(len(shape) + 3)[1:]) + (0,)
 
   def analysis(self, y, x, t, timestep, v, alpha):
@@ -334,12 +330,12 @@ class PiGDMVE(DDIMVE):
     self.data_variance = data_variance
     self.noise_std = noise_std
     self.num_y = y.shape[1]
-    self.estimate_h_x_0 = self.get_estimate_x_0(observation_map)
-    self.estimate_h_x_0_vmap = self.get_estimate_x_0_vmap(observation_map)
+    # This method requires clipping in order to remain (robustly, over all samples) numerically stable
+    self.estimate_h_x_0 = self.get_estimate_x_0(observation_map, clip=True)
+    self.estimate_h_x_0_vmap = self.get_estimate_x_0_vmap(observation_map, clip=True)
     self.batch_analysis_vmap = vmap(self.analysis)
     self.batch_observation_map = vmap(observation_map)
     self.jacrev_vmap = vmap(jacrev(lambda x, t, timestep: self.estimate_h_x_0_vmap(x, t, timestep)[0]))
-    # self.axes = (0,) + tuple(range(len(shape) + 2)[2:]) + (1,)
     self.axes_vmap = tuple(range(len(shape) + 1)[1:]) + (0,)
 
   def analysis(self, y, x, t, timestep, v):
@@ -380,6 +376,7 @@ class DPSSMLD(SMLD):
     super().__init__(score, sigma, ts)
     self.y = y
     self.scale = scale
+    # This method requires clipping in order to remain (robustly, over all samples) numerically stable
     self.likelihood_score = self.get_likelihood_score(
       self.get_estimate_x_0(observation_map, clip=True))
     self.likelihood_score_vmap = self.get_likelihood_score_vmap(
@@ -431,6 +428,7 @@ class DPSDDPM(DDPM):
     super().__init__(score, beta, ts)
     self.y = y
     self.scale = scale
+    # This method requires clipping in order to remain (robustly, over all samples) numerically stable
     self.likelihood_score = self.get_likelihood_score(
       self.get_estimate_x_0(observation_map, clip=True))
     self.likelihood_score_vmap = self.get_likelihood_score_vmap(
@@ -485,7 +483,6 @@ class KPDDPM(DDPM):
     self.batch_observation_map = vmap(observation_map)
     self.batch_observation_map = vmap(observation_map)
     self.jacrev_vmap = vmap(jacrev(lambda x, t, timestep: self.estimate_h_x_0_vmap(x, t, timestep)[0]))
-    # self.axes = (0,) + tuple(range(len(shape) + 2)[2:]) + (1,)
     self.axes_vmap = tuple(range(len(shape) + 1)[1:]) + (0,)
 
   def analysis(self, y, x, t, timestep, ratio):
@@ -542,8 +539,6 @@ class KPSMLD(SMLD):
     self.observation_map = observation_map
     self.batch_observation_map = vmap(observation_map)
     self.jacrev_vmap = vmap(jacrev(lambda x, t, timestep: self.estimate_h_x_0_vmap(x, t, timestep)[0]))
-    # axes tuple for correct permutation of grad_H_x_0 array
-    self.axes = (0,) + tuple(range(len(shape) + 2)[2:]) + (1,)
     self.axes_vmap = tuple(range(len(shape) + 1)[1:]) + (0,)
 
   def analysis(self, y, x, t, timestep, ratio):
