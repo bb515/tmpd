@@ -24,7 +24,8 @@ flags.mark_flags_as_required(["workdir", "config", "mode"])
 
 def main(argv):
     tf.config.experimental.set_visible_devices([], "GPU")
-    os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
+    os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'true'  # Less prone to GPU memory fragmentation, which should prevent OOM on CIFAR10
+    os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '.93'  # preallocate 93 percent of memory, which may cause OOM when the JAX program starts
     if FLAGS.mode == "sample":
         run_lib.sample(FLAGS.config, FLAGS.workdir, FLAGS.eval_folder)
     elif FLAGS.mode == "eval_from_file":

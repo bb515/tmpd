@@ -71,7 +71,7 @@ def get_config():
   evaluate = config.eval
   evaluate.begin_ckpt = 12
   evaluate.end_ckpt = 12
-  evaluate.batch_size = 128
+  evaluate.batch_size = 100  # CIFAR10 train.size=50000 and test.size=10000
   evaluate.pmap = False
   solver = config.solver
   solver.outer_solver = 'eulermaruyama'
@@ -87,7 +87,7 @@ def get_config():
   # solver.dps_scale_hyperparameter = 0.3  # for noise_std=0.1
 
   # inpainting square
-  solver.dps_scale_hyperparameter = 0.5  # for noise_std=0.01
+  # solver.dps_scale_hyperparameter = 0.5  # for noise_std=0.01
   # solver.dps_scale_hyperparameter = 0.3  # for noise_std=0.05
   # solver.dps_scale_hyperparameter = 0.05 # for noise_std=0.1
 
@@ -98,7 +98,7 @@ def get_config():
 
   # superresolution 4bicubic
   # solver.dps_scale_hyperparameter = 0.3 # for noise_std=0.01
-  # solver.dps_scale_hyperparameter = 0.15 # for noise_std=0.05
+  solver.dps_scale_hyperparameter = 0.15 # for noise_std=0.05
   # solver.dps_scale_hyperparameter = 0.15  # for noise_std=0.1
 
   return config

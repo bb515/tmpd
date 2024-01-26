@@ -202,9 +202,9 @@ def _sample(i, config, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampl
       fname=eval_path)
     if compute_metrics:
       x, data_pools, inception_model = compute_metrics
-      np.savez(eval_path + ".npz", x=q_samples, y=y, noise_std=config.sampling.noise_std)
-      save = False if search else True
-      return compute_metrics_inner(config, cs_method, eval_path, x, q_samples, data_pools, inception_model,
+      save = not search
+      return compute_metrics_inner(config, cs_method, eval_path, x, y, q_samples,
+                                   data_pools, inception_model,
                                    compute_lpips=True, save=save)
 
 
@@ -375,9 +375,9 @@ def get_sde(config):
       cs_methods = [
                     # 'KPSMLDdiag',
                     # 'TMPD2023bvjpplus',
-                    # 'KPSMLDplus',
+                    'KPSMLDplus',
                     'DPSSMLDplus',
-                    # 'PiGDMVEplus',
+                    'PiGDMVEplus',
                     # 'KGDMVEplus',
                     # 'chung2022scalarplus',  
                     # 'chung2022plus',  
@@ -510,7 +510,8 @@ def plot(train_data, mean, std, xlabel='x', ylabel='y',
   plt.close()
 
 
-def compute_metrics_inner(config, cs_method, eval_path, x, q_samples, data_pools, inception_model,
+def compute_metrics_inner(config, cs_method, eval_path, x, y, q_samples,
+                          data_pools, inception_model,
                           compute_lpips=True, save=True):
   samples = np.clip(q_samples * 255., 0, 255).astype(np.uint8)
   # Use inceptionV3 for images with resolution higher than 256.
@@ -594,6 +595,7 @@ def compute_metrics_inner(config, cs_method, eval_path, x, q_samples, data_pools
 
     if save: np.savez_compressed(
       eval_path + "_stats.npz",
+      x=q_samples, y=y, noise_std=config.sampling.noise_std,
       pool_3=tmp_pool_3, logits=tmp_logits,
       lpips=_lpips,
       psnr=_psnr,
@@ -620,6 +622,7 @@ def compute_metrics_inner(config, cs_method, eval_path, x, q_samples, data_pools
         ))
     if save: np.savez_compressed(
       eval_path + "_stats.npz",
+      x=q_samples, y=y, noise_std=config.sampling.noise_std,
       pool_3=tmp_pool_3, logits=tmp_logits,
       lpips=_lpips,
       psnr=_psnr,
@@ -839,18 +842,6 @@ def deblur(config, workdir, eval_folder="eval"):
 
 
 def super_resolution(config, workdir, eval_folder="eval"):
-  inverse_scaler = lambda x: x
-  x = get_eval_sample(lambda x : x, config, 1)
-  print(x.shape)
-
-  plot_samples(
-    x,
-    image_size=2**8,
-    num_channels=3,
-    fname="./"+ "{}_ground_{}_{}".format(
-      config.data.dataset, config.solver.outer_solver, 0))
-  assert 0
-
   (num_devices, cs_methods, sde, inverse_scaler, scaler, epsilon_fn, score_fn, sampling_shape, rng
     ) = _setup(config, workdir, eval_folder)
 
@@ -1001,6 +992,41 @@ def jpeg(config, workdir, eval_folder="eval"):
            inverse_scaler, y, H, observation_map, adjoint_observation_map, rng)
 
 
+def colorization(config, workdir, eval_folder="eval"):
+  (num_devices, cs_methods, sde, inverse_scaler, scaler, epsilon_fn, score_fn, sampling_shape, rng
+    ) = _setup(config, workdir, eval_folder)
+
+  num_sampling_rounds = 2
+
+  use_asset_sample = False
+  if use_asset_sample:
+    x = get_asset_sample(config)
+
+  for i in range(num_sampling_rounds):
+    if not use_asset_sample:
+      x = get_eval_sample(scaler, config, num_devices)
+      # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, sampling_shape, config)
+    _, y, _, _ = get_colorization_observation(rng, x, config)
+
+    _plot_ground_observed(x.copy(), y.copy(), x.shape, eval_folder, inverse_scaler, config, i)
+
+    if 'plus' not in config.sampling.cs_method:
+      raise NotImplementedError
+    else:
+      def observation_map(x):
+        grayscale = jnp.array([0.299, 0.587, 0.114])
+        grayscale = grayscale.reshape(1, 1, 1, -1)
+        x = x * grayscale
+        x = jnp.sum(x, axis=3)
+        return x.flatten()
+
+      adjoint_observation_map = None
+      H = None
+
+    _sample(i, config, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling_shape,
+            inverse_scaler, y, H, observation_map, adjoint_observation_map, rng)
+
+
 def inpainting(config, workdir, eval_folder="eval"):
   (num_devices, cs_methods, sde, inverse_scaler, scaler, epsilon_fn, score_fn, sampling_shape, rng
     ) = _setup(config, workdir, eval_folder)
@@ -1016,7 +1042,6 @@ def inpainting(config, workdir, eval_folder="eval"):
       x = get_eval_sample(scaler, config, num_devices)
       # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, sampling_shape, config)
     _, y, mask, num_obs = get_inpainting_observation(rng, x, config, mask_name='half')
-    # _, y, mask, num_obs = get_colorization_observation(rng, x, config)
 
     _plot_ground_observed(x.copy(), y.copy(), x.shape, eval_folder, inverse_scaler, config, i)
 
@@ -1038,17 +1063,10 @@ def inpainting(config, workdir, eval_folder="eval"):
       def observation_map(x):
           x = x.flatten()
           return mask * x
-      # def observation_map(x):
-      #   grayscale = jnp.array([0.299, 0.587, 0.114])
-      #   grayscale = grayscale.reshape(1, 1, 1, -1)
-      #   x = x * grayscale
-      #   x = jnp.sum(x, axis=3)
-      #   return x.flatten()
 
       adjoint_observation_map = None
       H = None
 
-    print(cs_methods)
     _sample(i, config, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling_shape,
             inverse_scaler, y, H, observation_map, adjoint_observation_map, rng)
 
@@ -1150,7 +1168,6 @@ def evaluate_inpainting(config,
       x = get_eval_sample(scaler, config, num_devices)
       # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, sampling_shape, config)
     _, y, mask, num_obs = get_inpainting_observation(rng, x, config, mask_name='square')
-    # _, y, mask, num_obs = get_colorization_observation(rng, x, config)
 
     _plot_ground_observed(x.copy(), y.copy(), x.shape, eval_folder, inverse_scaler, config, i)
 
@@ -1204,30 +1221,54 @@ def evaluate_super_resolution(config,
   data_stats = load_dataset_stats(config)
   data_pools = data_stats["pool_3"]
 
-  obs_shape=(config.eval.batch_size, config.data.image_size//4, config.data.image_size//4, config.data.num_channels)
+  num_down_sample = 4
+  obs_shape=(
+    config.eval.batch_size, config.data.image_size//num_down_sample,
+    config.data.image_size//num_down_sample, config.data.num_channels)
   method='bicubic'  # 'bicubic'
-  num_sampling_rounds = 6
 
   use_SS = False
   use_asset_sample = False
 
+  num_eval = 100
   if not use_SS:
-    if use_asset_sample:
-      eval_ds = get_eval_dataset(config)
-      batch = next(eval_iter)
+    if not use_asset_sample:
+      eval_ds = get_eval_dataset(scaler, config, num_devices)
+      eval_iter = iter(eval_ds)
       # TODO: can tree_map be used to pmap across observation data?
-      for i, batch in enumerate(iter(eval_iter)):
-
+      for i, batch in enumerate(eval_iter):
+        if i == num_eval//config.eval.batch_size:
+          # Only evaluate on those necessary
+          break
         eval_batch = jax.tree_map(lambda x: scaler(x._numpy()), batch)  # pylint: disable=protected-access
         x = eval_batch['image'][0]
         _, y, *_ = get_superresolution_observation(
           rng, x, config,
           shape=obs_shape,
           method=method)
-        print(x.shape)
-        print(y.shape)
-        assert 0
+
+        _plot_ground_observed(x.copy(), y.copy(), obs_shape, eval_folder, inverse_scaler, config, i)
+
+        def observation_map(x):
+          x = x.reshape(sampling_shape[1:])
+          y = jax.image.resize(x, obs_shape[1:], method)
+          return y.flatten()
+
+        def adjoint_observation_map(y):
+          y = y.reshape(obs_shape[1:])
+          x = jax.image.resize(y, sampling_shape[1:], method)
+          return x.flatten()
+
+        H = None
+
+        _sample(i, config, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling_shape,
+              inverse_scaler, y, H, observation_map, adjoint_observation_map, rng,
+                compute_metrics=(x, data_pools, inception_model))
+    else:
+      raise NotImplementedError
   else:
+    # TODO: This is Superseded
+    num_sampling_rounds = 6
     if use_asset_sample:
       x = get_asset_sample(config)
 
@@ -1312,7 +1353,7 @@ def dps_search_inpainting(
     _, y, mask, num_obs = get_inpainting_observation(rng, x, config, mask_name='square')
     # _, y, mask, num_obs = get_colorization_observation(rng, x, config)
 
-    _plot_ground_observed(x.copy(), y.copy(), x.shape, eval_folder, inverse_scaler, config, 0,
+    _plot_ground_observed(x.copy(), y.copy(), x.shape, eval_folder, inverse_scaler, config, scale,
                           search=True)
 
     if 'plus' not in config.sampling.cs_method and mask:
@@ -1384,6 +1425,10 @@ def dps_search_super_resolution(config,
   data_pools = data_stats["pool_3"]
 
   dps_hyperparameters = jnp.logspace(-1.5, 0.4, num=num_sampling_rounds, base=10.0)
+  dps_hyperparameters = jnp.logspace(-0.5, 1.4, num=num_sampling_rounds, base=10.0)
+  dps_hyperparameters = jnp.flip(dps_hyperparameters)
+  print(dps_hyperparameters)
+
   psnr_means = []
   psnr_stds = []
   lpips_means = []
@@ -1393,9 +1438,10 @@ def dps_search_super_resolution(config,
   mse_means = []
   mse_stds = []
 
-  obs_shape = (config.eval.batch_size, config.data.image_size//4, config.data.image_size//4, config.data.num_channels)
+  num_downscale = 4
+  obs_shape = (config.eval.batch_size, config.data.image_size//num_downscale,
+               config.data.image_size//num_downscale, config.data.num_channels)
   method = 'bicubic'
-  # obs_shape = (config.eval.batch_size, config.data.image_size//2, config.data.image_size//2, config.data.num_channels)
   # method = 'nearest'
 
   use_asset_sample = False
@@ -1415,7 +1461,7 @@ def dps_search_super_resolution(config,
     scale = float(f'{float(f"{scale:.3g}"):g}')
     config.solver.dps_scale_hyperparameter = scale
 
-    _plot_ground_observed(x.copy(), y.copy(), obs_shape, eval_folder, inverse_scaler, config, 0,
+    _plot_ground_observed(x.copy(), y.copy(), obs_shape, eval_folder, inverse_scaler, config, scale,
                           search=True)
 
     def observation_map(x):

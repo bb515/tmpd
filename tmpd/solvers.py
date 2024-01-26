@@ -410,12 +410,13 @@ class DPSSMLD(SMLD):
     ls, score = self.likelihood_score_vmap(x, t, timestep, self.y)
     x_mean, std = self.posterior(score, x, timestep)
 
-    sigma = self.discrete_sigmas[timestep]
-    sigma_prev = self.discrete_sigmas_prev[timestep]
-    x_mean = x_mean - batch_mul(1 - sigma_prev**2 / sigma**2, self.scale * ls)
+    # play around with dps method for the best weighting schedule...
+    # sigma = self.discrete_sigmas[timestep]
+    # sigma_prev = self.discrete_sigmas_prev[timestep]
+    # x_mean = x_mean - batch_mul(1 - sigma_prev**2 / sigma**2, self.scale * ls)
     # x_mean = x_mean - batch_mul(sigma**2, self.scale * ls)
     # Since DPS was empirically derived for VP SDE, the scaling in their paper will not work for VE SDE
-    # x_mean = x_mean - self.scale * ls  # Not the correct scaling for VE
+    x_mean = x_mean - self.scale * ls  # Not the correct scaling for VE
     z = random.normal(rng, x.shape)
     x = x_mean + batch_mul(std, z)
     return x, x_mean
