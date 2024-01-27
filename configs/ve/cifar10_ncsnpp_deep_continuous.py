@@ -65,7 +65,7 @@ def get_config():
   # sampling.cs_method = 'tmpd2023avjp'
 
   sampling.stack_samples = False
-  sampling.noise_std = 0.05
+  sampling.noise_std = 0.01
   sampling.denoise = True
   sampling.inverse_scaler = None
   evaluate = config.eval
@@ -97,8 +97,8 @@ def get_config():
   # solver.dps_scale_hyperparameter = 0.2  # for noise_std=0.1
 
   # superresolution 4bicubic
-  # solver.dps_scale_hyperparameter = 0.3 # for noise_std=0.01
-  solver.dps_scale_hyperparameter = 0.15 # for noise_std=0.05
+  solver.dps_scale_hyperparameter = 0.3 # for noise_std=0.01
+  # solver.dps_scale_hyperparameter = 0.15 # for noise_std=0.05
   # solver.dps_scale_hyperparameter = 0.15  # for noise_std=0.1
 
   return config

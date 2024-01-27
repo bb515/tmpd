@@ -89,4 +89,24 @@ def get_config():
   solver.dps_scale_hyperparameter = 0.5
   solver.mpgd_scale_hyperparameter = 0.
 
+  # inpainting half
+  # solver.dps_scale_hyperparameter =   # for noise_std=0.01
+  # solver.dps_scale_hyperparameter =   # for noise_std=0.05
+  # solver.dps_scale_hyperparameter =   # for noise_std=0.1
+
+  # inpainting square
+  # solver.dps_scale_hyperparameter =   # for noise_std=0.01
+  # solver.dps_scale_hyperparameter =   # for noise_std=0.05
+  # solver.dps_scale_hyperparameter =   # for noise_std=0.1
+
+  # superresolution 2nearest
+  # solver.dps_scale_hyperparameter =  # for noise_std=0.01
+  # solver.dps_scale_hyperparameter =  # for noise_std=0.05
+  # solver.dps_scale_hyperparameter =   # for noise_std=0.1
+
+  # superresolution 4bicubic
+  # solver.dps_scale_hyperparameter =  # for noise_std=0.01
+  solver.dps_scale_hyperparameter = 0.6  # for noise_std=0.05
+  # solver.dps_scale_hyperparameter =  # for noise_std=0.1
+
   return config
