@@ -38,6 +38,7 @@ import torchvision.transforms as transforms
 import torch
 import lpips
 import yaml
+from motionblur.motionblur import Kernel
 
 
 logging.basicConfig(filename=str(float(time.time())) + ".log",
@@ -429,6 +430,64 @@ def get_superresolution_observation(rng, x, config, shape, method='square'):
   x = flatten_vmap(x)
   mask = None  # TODO
   return x, y, mask, num_obs
+
+
+class Blurkernel(nn.Module):
+  def __init__(self, blur_type='gaussian', kernel_size=31, std=3., ):
+    # Probably shouldn't use flax? depends on how new version is
+    super().__init__()
+    self.blur_type = blur_type
+    self.kernel_size = kernel_size
+    self.std = std
+    self.weights_init()
+
+  @nn.compact
+  def __call__(self, x):
+    x_shape = x.shape
+    ndim = x.ndim
+    n_hidden = x_shape[1]
+
+    # not sure what the 3, 3 are for
+    x = nn.Conv(x_shape[-1], 3, 3, (self.kernel_size,) * (ndim -2), stride=1, padding=0, bias=False, groups=3)(x)
+    return x
+
+  def weights_init(self):
+    if self.blur_type == "gaussian":
+      n = jnp.zeros((self.kernel_size, self.kernel_size))
+      n[self.kernel_size // 2,self.kernel_size // 2] = 1
+      k = scipy.ndimage.gaussian_filter(n, sigma=self.std)
+      self.k = k
+      for name, f in self.named_parameters():  #??
+        f.data.copy_(k)
+    elif self.blur_type == "motion":
+      k = Kernel(size=(self.kernel_size, self.kernel_size), intensity=self.std).kernelMatrix
+      self.k = k
+      for name, f in self.named_parameters():
+        f.data.copy_(k)
+
+
+# class NonlinearBlurOperator:
+#   def __init__(self, opt_yml_path):
+#     self.blur_model = self.prepare_nonlinear_blur_model(opt_yml_path)
+
+#   def prepare_nonlinear_blur_model(self, opt_yml_path):
+#     from bkse.models.kernel_encoding.kernel_wizard import KernelWizard
+
+#     with open(opt_yml_path, "r") as f:
+#       opt = yaml.safe_load(f)["KernelWizard"]
+#       model_path = opt["pretrained"]
+#     blur_model = KernelWizard(opt)
+#     blur_model.eval()
+#     blur_model.load_state_dict(torch.load(model_path))
+#     blur_model = blur_model.to(self.device)
+#     return blur_model
+
+#   def forward(self, data, **kwargs):
+#     random_kernel = torch.randn(1, 512, 2, 2).to(self.device) * 1.2
+#     data = (data + 1.0) / 2.0  #[-1, 1] -> [0, 1]
+#     blurred = self.blur_model.adaptKernel(data, kernel=random_kernel)
+#     blurred = (blurred * 2.0 - 1.0).clamp(-1, 1) #[0, 1] -> [-1, 1]
+#     return blurred
 
 
 def get_blur_observation(rng, x, config, device=None):
