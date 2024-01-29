@@ -38,7 +38,7 @@ import torchvision.transforms as transforms
 import torch
 import lpips
 import yaml
-from motionblur.motionblur import Kernel
+# from motionblur.motionblur import Kernel
 
 
 logging.basicConfig(filename=str(float(time.time())) + ".log",
@@ -432,38 +432,38 @@ def get_superresolution_observation(rng, x, config, shape, method='square'):
   return x, y, mask, num_obs
 
 
-class Blurkernel(nn.Module):
-  def __init__(self, blur_type='gaussian', kernel_size=31, std=3., ):
-    # Probably shouldn't use flax? depends on how new version is
-    super().__init__()
-    self.blur_type = blur_type
-    self.kernel_size = kernel_size
-    self.std = std
-    self.weights_init()
+# class Blurkernel(nn.Module):
+#   def __init__(self, blur_type='gaussian', kernel_size=31, std=3., ):
+#     # Probably shouldn't use flax? depends on how new version is
+#     super().__init__()
+#     self.blur_type = blur_type
+#     self.kernel_size = kernel_size
+#     self.std = std
+#     self.weights_init()
 
-  @nn.compact
-  def __call__(self, x):
-    x_shape = x.shape
-    ndim = x.ndim
-    n_hidden = x_shape[1]
+#   @nn.compact
+#   def __call__(self, x):
+#     x_shape = x.shape
+#     ndim = x.ndim
+#     n_hidden = x_shape[1]
 
-    # not sure what the 3, 3 are for
-    x = nn.Conv(x_shape[-1], 3, 3, (self.kernel_size,) * (ndim -2), stride=1, padding=0, bias=False, groups=3)(x)
-    return x
+#     # not sure what the 3, 3 are for
+#     x = nn.Conv(x_shape[-1], 3, 3, (self.kernel_size,) * (ndim -2), stride=1, padding=0, bias=False, groups=3)(x)
+#     return x
 
-  def weights_init(self):
-    if self.blur_type == "gaussian":
-      n = jnp.zeros((self.kernel_size, self.kernel_size))
-      n[self.kernel_size // 2,self.kernel_size // 2] = 1
-      k = scipy.ndimage.gaussian_filter(n, sigma=self.std)
-      self.k = k
-      for name, f in self.named_parameters():  #??
-        f.data.copy_(k)
-    elif self.blur_type == "motion":
-      k = Kernel(size=(self.kernel_size, self.kernel_size), intensity=self.std).kernelMatrix
-      self.k = k
-      for name, f in self.named_parameters():
-        f.data.copy_(k)
+#   def weights_init(self):
+#     if self.blur_type == "gaussian":
+#       n = jnp.zeros((self.kernel_size, self.kernel_size))
+#       n[self.kernel_size // 2,self.kernel_size // 2] = 1
+#       k = scipy.ndimage.gaussian_filter(n, sigma=self.std)
+#       self.k = k
+#       for name, f in self.named_parameters():  #??
+#         f.data.copy_(k)
+#     elif self.blur_type == "motion":
+#       k = Kernel(size=(self.kernel_size, self.kernel_size), intensity=self.std).kernelMatrix
+#       self.k = k
+#       for name, f in self.named_parameters():
+#         f.data.copy_(k)
 
 
 # class NonlinearBlurOperator:
@@ -490,7 +490,19 @@ class Blurkernel(nn.Module):
 #     return blurred
 
 
-def get_blur_observation(rng, x, config, device=None):
+def get_gaussian_blur_observation(rng, x, config):
+  """Linear blur model."""
+  import scipy
+  kernel_size = 100
+  std = 100
+  def blur_model():
+    n = jnp.zeros((kernel_size, kernel_size))
+    n[kernel_size // 2, kernel_size // 2] = 1
+    k = scipy.ndimage.gaussian_filter(n, sigma=std)
+
+
+def get_nonlinear_blur_observation(rng, x, config):
+  """TODO: This is the non-linear blur model."""
   from bkse.models.kernel_encoding.kernel_wizard import KernelWizard
 
   def get_blur_model(opt_yml_path):
@@ -499,6 +511,8 @@ def get_blur_observation(rng, x, config, device=None):
       model_path = opt["pretrained"]
     blur_model = KernelWizard(opt)
     blur_model.eval()
+    print(model_path)
+    assert 0
     blur_model.load_state_dict(torch.load(model_path))
     # blur_model = blur_model.to(device)
     return blur_model
@@ -856,16 +870,21 @@ def deblur(config, workdir, eval_folder="eval"):
   (num_devices, cs_methods, sde, inverse_scaler, scaler, epsilon_fn, score_fn, sampling_shape, rng
     ) = _setup(config, workdir, eval_folder)
 
-  obs_shape = (config.data.image_size//2, config.data.image_size//2, config.data.num_channels)
+  obs_shape = (config.data.image_size, config.data.image_size, config.data.num_channels)
   num_sampling_rounds = 2
 
-  for i in range(num_sampling_rounds):
-    x = get_eval_sample(scaler, inverse_scaler, config, eval_folder, num_devices)
+  use_asset_sample = True
+  if use_asset_sample:
+    x = get_asset_sample(config)
+  else:
+    x = get_eval_sample(scaler, config, num_devices)
     # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, sampling_shape, config)
-    _, y, observation_map, _ = get_blur_observation(
-        rng, x, config)
+  _, y, observation_map, _ = get_blur_observation(rng, x, config)
+  _plot_ground_observed(x.copy(), y.copy(), obs_shape, eval_folder, inverse_scaler, config, 0)
+  assert 0
 
-    _plot_ground_observed(x.copy(), y.copy(), obs_shape, eval_folder, inverse_scaler, config, i)
+  for i in range(num_sampling_rounds):
+
 
     print(observation_map)
     assert 0
