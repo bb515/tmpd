@@ -278,18 +278,19 @@ class PiGDMVPplus(PiGDMVP):
       lambda x: self.estimate_h_x_0_vmap(x, t, timestep), x, has_aux=True)
     # Value suggested for VPSDE in original PiGDM paper
     r = v * self.data_variance  / (v + alpha * self.data_variance)
-    C_yy = r + self.noise_std**2
+    C_yy = 1. + self.noise_std**2 / r
     ls = vjp_estimate_h_x_0((y - h_x_0) / C_yy)[0]
     return epsilon.squeeze(axis=0), ls
 
 
-class SSPiGDMVP(DDIMVP):
+class ReproducePiGDMVP(DDIMVP):
   """
-  Note: We found this method to be unstable on all datasets.
+  NOTE: We found this method to be unstable on all datasets, unless static
+    thresholding (clip=True) is used at each step of estimating x_0.
   PiGDM Song et al. 2023. Markov chain using the DDIM Markov Chain or VP SDE."""
   def __init__(self, y, observation_map, noise_std, shape, model, eta=0.0, beta=None, ts=None):
     super().__init__(model, eta, beta, ts)
-    self.estimate_h_x_0 = self.get_estimate_x_0_vmap(observation_map)
+    self.estimate_h_x_0 = self.get_estimate_x_0_vmap(observation_map, clip=True, centered=True)
     self.batch_analysis_vmap = vmap(self.analysis)
     self.y = y
     self.noise_std = noise_std
@@ -298,10 +299,12 @@ class SSPiGDMVP(DDIMVP):
   def analysis(self, y, x, t, timestep, v, alpha):
     h_x_0, vjp_estimate_h_x_0, (epsilon, x_0) = vjp(
       lambda x: self.estimate_h_x_0(x, t, timestep), x, has_aux=True)
-    # Value suggested for VPSDE in original PiGDM paper
-    r = v * self.data_variance  / (v + alpha * self.data_variance)
-    C_yy = r + self.noise_std**2
-    ls = r * vjp_estimate_h_x_0((y - h_x_0) / C_yy)[0]
+    # Value suggested for VPSDE in original PiGDM paper:
+    r = v * self.data_variance  / (v + self.data_variance)
+    # What it should really be set to, following the authors' mathematical reasoning:
+    # r = v * self.data_variance  / (v + alpha * self.data_variance)
+    C_yy = 1. + self.noise_std**2 / r
+    ls = vjp_estimate_h_x_0((y - h_x_0) / C_yy)[0]
     return x_0.squeeze(axis=0), ls, epsilon.squeeze(axis=0)
 
   def posterior(self, x, t):
@@ -319,6 +322,23 @@ class SSPiGDMVP(DDIMVP):
     x_mean = batch_mul(m_prev, x_0) + batch_mul(coeff2, epsilon) + batch_mul(m, ls)
     std = coeff1
     return x_mean, std
+
+
+class ReproducePiGDMVPplus(PiGDMVP):
+  """
+  NOTE: We found this method to be unstable on all datasets, unless static
+    thresholding (clip=True) is used at each step of estimating x_0.
+  PiGDM with a mask. Song et al. 2023. Markov chain using the DDIM Markov Chain or VP SDE."""
+  def analysis(self, y, x, t, timestep, v, alpha):
+    h_x_0, vjp_estimate_h_x_0, (epsilon, _) = vjp(
+      lambda x: self.estimate_h_x_0_vmap(x, t, timestep), x, has_aux=True)
+    # Value suggested for VPSDE in original PiGDM paper:
+    r = v * self.data_variance  / (v + self.data_variance)
+    # What it should really be set to, following the authors' mathematical reasoning:
+    # r = v * self.data_variance  / (v + alpha * self.data_variance)
+    C_yy = 1. + self.noise_std**2 / r
+    ls = vjp_estimate_h_x_0((y - h_x_0) / C_yy)[0]
+    return epsilon.squeeze(axis=0), ls
 
 
 class PiGDMVE(DDIMVE):
@@ -372,16 +392,17 @@ class PiGDMVEplus(PiGDMVE):
 
 
 class DPSSMLD(SMLD):
-  """DPS for SMLD ancestral sampling."""
+  """DPS for SMLD ancestral sampling.
+    NOTE: This method requires static thresholding (clip=True) in order to remain
+      (robustly, over all samples) numerically stable"""
   def __init__(self, scale, y, observation_map, score, sigma=None, ts=None):
     super().__init__(score, sigma, ts)
     self.y = y
     self.scale = scale
-    # This method requires clipping in order to remain (robustly, over all samples) numerically stable
     self.likelihood_score = self.get_likelihood_score(
-      self.get_estimate_x_0(observation_map, clip=True))
+      self.get_estimate_x_0(observation_map, clip=True, centered=False))
     self.likelihood_score_vmap = self.get_likelihood_score_vmap(
-      self.get_estimate_x_0_vmap(observation_map, clip=True))
+      self.get_estimate_x_0_vmap(observation_map, clip=True, centered=False))
 
   def get_likelihood_score_vmap(self, estimate_h_x_0_vmap):
     def l2_norm(x, t, timestep, y):
@@ -424,16 +445,17 @@ DPSSMLDplus = DPSSMLD
 
 
 class DPSDDPM(DDPM):
-  """DPS for DDPM ancestral sampling."""
+  """DPS for DDPM ancestral sampling.
+    NOTE: This method requires static thresholding (clip=True) in order to remain
+      (robustly, over all samples) numerically stable"""
   def __init__(self, scale, y, observation_map, score, beta=None, ts=None):
     super().__init__(score, beta, ts)
     self.y = y
     self.scale = scale
-    # This method requires clipping in order to remain (robustly, over all samples) numerically stable
     self.likelihood_score = self.get_likelihood_score(
-      self.get_estimate_x_0(observation_map, clip=True))
+      self.get_estimate_x_0(observation_map, clip=True, centered=True))
     self.likelihood_score_vmap = self.get_likelihood_score_vmap(
-      self.get_estimate_x_0_vmap(observation_map, clip=True))
+      self.get_estimate_x_0_vmap(observation_map, clip=True, centered=True))
 
   def get_likelihood_score_vmap(self, estimate_h_x_0_vmap):
     def l2_norm(x, t, timestep, y):

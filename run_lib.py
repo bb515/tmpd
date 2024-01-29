@@ -37,7 +37,7 @@ from torchvision.datasets import VisionDataset
 import torchvision.transforms as transforms
 import torch
 import lpips
-import yaml
+# import yaml
 # from motionblur.motionblur import Kernel
 
 
@@ -52,7 +52,7 @@ flatten_vmap = vmap(lambda x: x.flatten())
 
 unconditional_ddim_methods = ['DDIMVE', 'DDIMVP', 'DDIMVEplus', 'DDIMVPplus']
 unconditional_markov_methods = ['DDIM', 'DDIMplus', 'SMLD', 'SMLDplus']
-ddim_methods = ['PiGDMVP', 'PiGDMVE', 'PiGDMVPplus', 'PiGDMVEplus',
+ddim_methods = ['ReproducePiGDMVP', 'PiGDMVP', 'PiGDMVE', 'PiGDMVPplus', 'PiGDMVEplus',
   'KGDMVP', 'KGDMVE', 'KGDMVPplus', 'KGDMVEplus']
 markov_methods = ['KPDDPM', 'KPDDPMplus', 'KPSMLD', 'KPSMLDplus']
 
@@ -99,7 +99,7 @@ def _plot_ground_observed(x, y, obs_shape, eval_folder, inverse_scaler, config, 
     num_channels=config.data.num_channels,
     fname=eval_path + "{}_observed_{}_{}".format(
       config.data.dataset, config.solver.outer_solver, i))
-  np.savez(eval_path + "{}_ground_observed_{}.npz".format(
+  np.savez(eval_path + "{}_ground_observed_{}_{}.npz".format(
     config.sampling.noise_std, config.data.dataset, i),
     x=jnp.array(x), y=y, noise_std=config.sampling.noise_std)
 
@@ -490,46 +490,46 @@ def get_superresolution_observation(rng, x, config, shape, method='square'):
 #     return blurred
 
 
-def get_gaussian_blur_observation(rng, x, config):
-  """Linear blur model."""
-  import scipy
-  kernel_size = 100
-  std = 100
-  def blur_model():
-    n = jnp.zeros((kernel_size, kernel_size))
-    n[kernel_size // 2, kernel_size // 2] = 1
-    k = scipy.ndimage.gaussian_filter(n, sigma=std)
+# def get_gaussian_blur_observation(rng, x, config):
+#   """Linear blur model."""
+#   import scipy
+#   kernel_size = 100
+#   std = 100
+#   def blur_model():
+#     n = jnp.zeros((kernel_size, kernel_size))
+#     n[kernel_size // 2, kernel_size // 2] = 1
+#     k = scipy.ndimage.gaussian_filter(n, sigma=std)
 
 
-def get_nonlinear_blur_observation(rng, x, config):
-  """TODO: This is the non-linear blur model."""
-  from bkse.models.kernel_encoding.kernel_wizard import KernelWizard
+# def get_nonlinear_blur_observation(rng, x, config):
+#   """TODO: This is the non-linear blur model."""
+#   from bkse.models.kernel_encoding.kernel_wizard import KernelWizard
 
-  def get_blur_model(opt_yml_path):
-    with open(opt_yml_path, "r") as f:
-      opt = yaml.safe_load(f)["KernelWizard"]
-      model_path = opt["pretrained"]
-    blur_model = KernelWizard(opt)
-    blur_model.eval()
-    print(model_path)
-    assert 0
-    blur_model.load_state_dict(torch.load(model_path))
-    # blur_model = blur_model.to(device)
-    return blur_model
+#   def get_blur_model(opt_yml_path):
+#     with open(opt_yml_path, "r") as f:
+#       opt = yaml.safe_load(f)["KernelWizard"]
+#       model_path = opt["pretrained"]
+#     blur_model = KernelWizard(opt)
+#     blur_model.eval()
+#     print(model_path)
+#     assert 0
+#     blur_model.load_state_dict(torch.load(model_path))
+#     # blur_model = blur_model.to(device)
+#     return blur_model
 
-  opt_yml_path = './bkse/options/generate_blur/default.yml'
-  blur_model = get_blur_model(opt_yml_path)
+#   opt_yml_path = './bkse/options/generate_blur/default.yml'
+#   blur_model = get_blur_model(opt_yml_path)
 
-  def observation_map(x):
-    random_kernel = random.randn(1, config.image_size, 2, 2) * 1.2
-    # x = (x + 1.) / 2.  # do I need?
-    blurred = blur_model(x, kernel=random_kernel)
-    return blurred
+#   def observation_map(x):
+#     random_kernel = random.randn(1, config.image_size, 2, 2) * 1.2
+#     # x = (x + 1.) / 2.  # do I need?
+#     blurred = blur_model(x, kernel=random_kernel)
+#     return blurred
 
-  y = observation_map(x)
-  y = y + random.normal(rng, y.shape) * config.sampling.noise_std
-  num_obs = jnp.size(y)
-  return x, y, observation_map, num_obs
+#   y = observation_map(x)
+#   y = y + random.normal(rng, y.shape) * config.sampling.noise_std
+#   num_obs = jnp.size(y)
+#   return x, y, observation_map, num_obs
 
 
 def image_grid(x, image_size, num_channels):
@@ -757,7 +757,7 @@ def compute_metrics(config, cs_methods, eval_folder):
             flag = 0
 
         if not inceptionv3:
-          logging.info("tmpd_logits.shape: {}, len(all_logits)".format(
+          logging.info("tmpd_logits.shape: {}, len(all_logits): {}".format(
             tmp_logits.shape, len(all_logits)))
           all_logits.append(tmp_logits)
         all_pools.append(tmp_pools)
@@ -866,58 +866,58 @@ def compute_metrics(config, cs_methods, eval_folder):
         )
 
 
-def deblur(config, workdir, eval_folder="eval"):
-  (num_devices, cs_methods, sde, inverse_scaler, scaler, epsilon_fn, score_fn, sampling_shape, rng
-    ) = _setup(config, workdir, eval_folder)
+# def deblur(config, workdir, eval_folder="eval"):
+#   (num_devices, cs_methods, sde, inverse_scaler, scaler, epsilon_fn, score_fn, sampling_shape, rng
+#     ) = _setup(config, workdir, eval_folder)
 
-  obs_shape = (config.data.image_size, config.data.image_size, config.data.num_channels)
-  num_sampling_rounds = 2
+#   obs_shape = (config.data.image_size, config.data.image_size, config.data.num_channels)
+#   num_sampling_rounds = 2
 
-  use_asset_sample = True
-  if use_asset_sample:
-    x = get_asset_sample(config)
-  else:
-    x = get_eval_sample(scaler, config, num_devices)
-    # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, sampling_shape, config)
-  _, y, observation_map, _ = get_blur_observation(rng, x, config)
-  _plot_ground_observed(x.copy(), y.copy(), obs_shape, eval_folder, inverse_scaler, config, 0)
-  assert 0
+#   use_asset_sample = True
+#   if use_asset_sample:
+#     x = get_asset_sample(config)
+#   else:
+#     x = get_eval_sample(scaler, config, num_devices)
+  #   x = get_prior_sample(rng, score_fn, epsilon_fn, sde, sampling_shape, config)
+  # _, y, observation_map, _ = get_blur_observation(rng, x, config)
+  # _plot_ground_observed(x.copy(), y.copy(), obs_shape, eval_folder, inverse_scaler, config, 0)
+  # assert 0
 
-  for i in range(num_sampling_rounds):
+  # for i in range(num_sampling_rounds):
 
 
-    print(observation_map)
-    assert 0
-    adjoint_observation_map = None
+  #   print(observation_map)
+  #   assert 0
+  #   adjoint_observation_map = None
 
-    H = None
-    cs_method = config.sampling.cs_method
+  #   H = None
+  #   cs_method = config.sampling.cs_method
 
-    for cs_method in cs_methods:
-      config.sampling.cs_method = cs_method
-      if cs_method in ddim_methods:
-        sampler = get_cs_sampler(config, sde, epsilon_fn, sampling_shape, inverse_scaler,
-          y, H, observation_map, adjoint_observation_map, stack_samples=False)
-      else:
-        sampler = get_cs_sampler(config, sde, score_fn, sampling_shape, inverse_scaler,
-          y, H, observation_map, adjoint_observation_map, stack_samples=False)
+  #   for cs_method in cs_methods:
+  #     config.sampling.cs_method = cs_method
+  #     if cs_method in ddim_methods:
+  #       sampler = get_cs_sampler(config, sde, epsilon_fn, sampling_shape, inverse_scaler,
+  #         y, H, observation_map, adjoint_observation_map, stack_samples=False)
+  #     else:
+  #       sampler = get_cs_sampler(config, sde, score_fn, sampling_shape, inverse_scaler,
+  #         y, H, observation_map, adjoint_observation_map, stack_samples=False)
 
-      rng, sample_rng = random.split(rng, 2)
-      if config.eval.pmap:
-        # sampler = jax.pmap(sampler, axis_name='batch')
-        rng, *sample_rng = random.split(rng, jax.local_device_count() + 1)
-        sample_rng = jnp.asarray(sample_rng)
-      else:
-        rng, sample_rng = random.split(rng, 2)
+  #     rng, sample_rng = random.split(rng, 2)
+  #     if config.eval.pmap:
+  #       # sampler = jax.pmap(sampler, axis_name='batch')
+  #       rng, *sample_rng = random.split(rng, jax.local_device_count() + 1)
+  #       sample_rng = jnp.asarray(sample_rng)
+  #     else:
+  #       rng, sample_rng = random.split(rng, 2)
 
-      q_samples, _ = sampler(sample_rng)
-      q_samples = q_samples.reshape((config.eval.batch_size,) + sampling_shape[1:])
-      print(q_samples, "\nconfig.sampling.cs_method")
-      plot_samples(
-        q_samples,
-        image_size=config.data.image_size,
-        num_channels=config.data.num_channels,
-        fname=eval_folder + "/{}_{}_{}_{}".format(config.data.dataset, config.sampling.noise_std, config.sampling.cs_method.lower(), i))
+  #     q_samples, _ = sampler(sample_rng)
+  #     q_samples = q_samples.reshape((config.eval.batch_size,) + sampling_shape[1:])
+  #     print(q_samples, "\nconfig.sampling.cs_method")
+  #     plot_samples(
+  #       q_samples,
+  #       image_size=config.data.image_size,
+  #       num_channels=config.data.num_channels,
+  #       fname=eval_folder + "/{}_{}_{}_{}".format(config.data.dataset, config.sampling.noise_std, config.sampling.cs_method.lower(), i))
 
 
 def super_resolution(config, workdir, eval_folder="eval"):
@@ -1283,7 +1283,7 @@ def evaluate_inpainting(config,
               inverse_scaler, y, H, observation_map, adjoint_observation_map, rng,
                 compute_metrics=(x, data_pools, inception_model))
     else:
-      raise NotImplemented
+      raise NotImplementedError
 
   else:
     # TODO: This is SuperSeded
@@ -1579,8 +1579,8 @@ def dps_search_super_resolution(config,
     shape=obs_shape,
     method=method)
 
-  _plot_ground_observed(x.copy(), y.copy(), obs_shape, eval_folder, inverse_scaler, config, scale,
-                        search=True)
+  _plot_ground_observed(x.copy(), y.copy(), obs_shape, eval_folder,
+                        inverse_scaler, config, 0, search=True)
 
   for scale in dps_hyperparameters:
     # round to 3 sig fig

@@ -15,7 +15,6 @@ import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
 from glob import glob
 from PIL import Image
-import matplotlib.pyplot as plt
 
 
 def dct1(x):
@@ -171,7 +170,7 @@ def idct_3d(X, norm=None):
     :param norm: the normalization, None or 'ortho'
     :return: the DCT-II of the signal over the last 3 dimensions
     """
-    print(x.shape)
+    print(X.shape)
     assert 0
     x1 = idct(X, norm=norm)
     x2 = idct(x1.transpose(-1, -2), norm=norm)
