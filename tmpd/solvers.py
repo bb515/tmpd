@@ -257,13 +257,14 @@ class PiGDMVP(DDIMVP):
     m = self.sqrt_alphas_cumprod[timestep]
     sqrt_1m_alpha = self.sqrt_1m_alphas_cumprod[timestep]
     v = sqrt_1m_alpha**2
-    alpha = m**2
+    alpha = self.alphas_cumprod[timestep]
     epsilon, ls = self.batch_analysis_vmap(self.y, x, t, timestep, v, alpha)
     m_prev = self.sqrt_alphas_cumprod_prev[timestep]
     v_prev = self.sqrt_1m_alphas_cumprod_prev[timestep]**2
-    alpha_prev = m_prev**2
+    alpha_prev = self.alphas_cumprod_prev[timestep]
     coeff1 = self.eta * jnp.sqrt((v_prev / v) * (1 - alpha / alpha_prev))
     coeff2 = jnp.sqrt(v_prev - coeff1**2)
+    # TODO: slightly different to Algorithm 1
     posterior_score = - batch_mul(1. / sqrt_1m_alpha, epsilon) + ls
     x_mean = batch_mul(m_prev / m, x) + batch_mul(sqrt_1m_alpha * (sqrt_1m_alpha * m_prev / m - coeff2), posterior_score)
     std = coeff1
@@ -308,11 +309,11 @@ class SSPiGDMVP(DDIMVP):
     m = self.sqrt_alphas_cumprod[timestep]
     sqrt_1m_alpha = self.sqrt_1m_alphas_cumprod[timestep]
     v = sqrt_1m_alpha**2
-    alpha = m**2
+    alpha = self.alphas_cumprod[timestep]
     x_0, ls, epsilon = self.batch_analysis_vmap(x, t, timestep, v, alpha)
     m_prev = self.sqrt_alphas_cumprod_prev[timestep]
     v_prev = self.sqrt_1m_alphas_cumprod_prev[timestep]**2
-    alpha_prev = m_prev**2
+    alpha_prev = self.alphas_cumprod_prev[timestep]
     coeff1 = self.eta * jnp.sqrt((v_prev / v) * (1 - alpha / alpha_prev))
     coeff2 = jnp.sqrt(v_prev - coeff1**2)
     x_mean = batch_mul(m_prev, x_0) + batch_mul(coeff2, epsilon) + batch_mul(m, ls)

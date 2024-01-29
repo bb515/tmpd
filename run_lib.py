@@ -618,7 +618,7 @@ def compute_metrics_inner(config, cs_method, eval_path, x, y, q_samples,
   stable_mse_mean = np.mean(all_stable_mse)
   stable_mse_std = np.std(all_stable_mse)
 
-  logging.info("tmpd_pool_3.shape: {}".format(tmp_pool_3.shape))
+  logging.info("tmp_pool_3.shape: {}".format(tmp_pool_3.shape))
   # must have rank 2 to calculate distribution distances
   if tmp_pool_3.shape[0] > 1:
     # Compute FID/KID/IS on individual inverse problem
