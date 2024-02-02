@@ -66,19 +66,18 @@ def get_config():
   model.fourier_scale = 16
   model.conv_size = 3
 
-
   # optim
   config.seed = 2023
   sampling.cs_method = 'TMPD2023bvjpplus'
 
   sampling.stack_samples = False
-  sampling.noise_std = 0.05
+  sampling.noise_std = 0.1
   sampling.denoise = True
   sampling.inverse_scaler = None
   evaluate = config.eval
   evaluate.begin_ckpt = 48
   evaluate.end_ckpt = 48
-  evaluate.batch_size = 1
+  evaluate.batch_size = 10
   evaluate.pmap = False
   solver = config.solver
   solver.num_outer_steps = config.model.num_scales
@@ -97,14 +96,13 @@ def get_config():
   # solver.dps_scale_hyperparameter = 1.0  # for noise_std=0.05
   # solver.dps_scale_hyperparameter = 0.5 # for noise_std=0.1
 
-  # superresolution 4nearest
+  # superresolution 4bicubic
   # solver.dps_scale_hyperparameter = 1.0 # for noise_std=0.01
   # solver.dps_scale_hyperparameter = 1.0 # for noise_std=0.05
-  # solver.dps_scale_hyperparameter = 0.5  # for noise_std=0.1
+  solver.dps_scale_hyperparameter = 0.5  # for noise_std=0.1
 
   # superresolution 8bicubic
   # solver.dps_scale_hyperparameter = 1.0 # for noise_std=0.01
   # solver.dps_scale_hyperparameter = 0.5 # for noise_std=0.05
-  solver.dps_scale_hyperparameter = 0.3 # for noise_std=0.05
   # solver.dps_scale_hyperparameter = 0.5  # for noise_std=0.1
   return config

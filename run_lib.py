@@ -81,27 +81,26 @@ def _dps_method(config):
 
 
 def _plot_ground_observed(x, y, obs_shape, eval_folder, inverse_scaler, config, i, search=False):
+  """Assume x, y are in the space of the diffusion model, so that x \in diffusion_model_space,
+  and inverse_scaler(x) \in [0., 1.]."""
+
   if search :
     eval_path = eval_folder + "/search_{}_".format(i)
   else:
     eval_path = eval_folder + "/_"
 
-  # TODO: should not name outer_solver if sample taken from validation set
   plot_samples(
     inverse_scaler(x),
     image_size=config.data.image_size,
     num_channels=config.data.num_channels,
-    fname=eval_path + "{}_ground_{}_{}".format(
-      config.data.dataset, config.solver.outer_solver, i))
+    fname=eval_path + "{}_{}_ground_{}".format(
+      config.sampling.noise_std, config.data.dataset, i))
   plot_samples(
     inverse_scaler(y),
     image_size=obs_shape[1],
     num_channels=config.data.num_channels,
-    fname=eval_path + "{}_observed_{}_{}".format(
-      config.data.dataset, config.solver.outer_solver, i))
-  np.savez(eval_path + "{}_ground_observed_{}_{}.npz".format(
-    config.sampling.noise_std, config.data.dataset, i),
-    x=jnp.array(x), y=y, noise_std=config.sampling.noise_std)
+    fname=eval_path + "{}_{}_observed_{}".format(
+      config.sampling.noise_std, config.data.dataset, i))
 
 
 def torch_lpips(loss_fn_vgg, x, samples):
@@ -168,6 +167,8 @@ class FFHQDataset(VisionDataset):
 def _sample(i, config, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling_shape,
             inverse_scaler, y, H, observation_map, adjoint_observation_map, rng,
             compute_metrics=False, search=False):
+  """Assume x, y are in the space of the diffusion model, so that x \in diffusion_model_space,
+  and inverse_scaler(x) \in [0., 1.]."""
   metrics = []
   for cs_method in cs_methods:
     config.sampling.cs_method = cs_method
@@ -187,6 +188,7 @@ def _sample(i, config, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampl
       rng, sample_rng = random.split(rng, 2)
 
     time_prev = time.time()
+    # q_samples is in the space [0., 1.]
     q_samples, _ = sampler(sample_rng)
     sample_time = time.time() - time_prev
 
@@ -205,10 +207,12 @@ def _sample(i, config, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampl
       num_channels=config.data.num_channels,
       fname=eval_path)
     if compute_metrics:
-      x, data_pools, inception_model = compute_metrics
+      x, data_pools, inception_model, inceptionv3 = compute_metrics
       save = not search
-      metrics.append(compute_metrics_inner(config, cs_method, eval_path, x, y, q_samples,
-                            data_pools, inception_model, compute_lpips=True, save=save))
+      # NOTE: Take x and y from diffusion model space to \in [0., 1.], the space of q_samples
+      metrics.append(compute_metrics_inner(config, cs_method, eval_path,
+                            inverse_scaler(x), inverse_scaler(y), q_samples,
+                            data_pools, inception_model, inceptionv3, compute_lpips=True, save=save))
   return metrics
 
 
@@ -311,11 +315,8 @@ def get_prior_sample(rng, score_fn, epsilon_fn, sde, sampling_shape, config):
 
 
 def get_eval_sample(scaler, config, num_devices):
-  # Build data pipeline
-  _, eval_ds, _ = datasets.get_dataset(num_devices,
-                                       config,
-                                       uniform_dequantization=config.data.uniform_dequantization,
-                                       evaluation=True)
+  eval_ds = get_eval_dataset(scaler, config, num_devices)
+  # get iterator over dataset
   eval_iter = iter(eval_ds)
   batch = next(eval_iter)
   # TODO: can tree_map be used to pmap across observation data?
@@ -324,11 +325,11 @@ def get_eval_sample(scaler, config, num_devices):
 
 
 def get_eval_dataset(scaler, config, num_devices):
+  # Build data pipeline
   _, eval_ds, _ = datasets.get_dataset(num_devices,
                                        config,
                                        uniform_dequantization=config.data.uniform_dequantization,
                                        evaluation=True)
-  # get iterator over dataste
   return eval_ds
 
 
@@ -342,19 +343,20 @@ def get_sde(config):
       cs_methods = [
                     'KPDDPM',
                     'DPSDDPM',
-                    'PiGDMVP',
-                    'TMPD2023b',
-                    'Chung2022scalar',  
-                    'Song2023',
+                    # 'PiGDMVP',
+                    # 'TMPD2023b',
+                    # 'Chung2022scalar',  
+                    # 'Song2023',
                     ]
     else:
       # VP/DDM methods with mask
       cs_methods = [
                     'KPDDPMplus',
                     'DPSDDPMplus',
+                    # 'ReproducePiGDMVPplus',
                     'PiGDMVPplus',
                     'TMPD2023bvjpplus',
-                    'chung2022scalarplus',  
+                    'chung2022scalarplus',
                     'Song2023plus',
                     ]
   elif config.training.sde.lower() == 'vesde':
@@ -376,14 +378,14 @@ def get_sde(config):
       # VE/SMLD methods with mask
       cs_methods = [
                     # 'KPSMLDdiag',
-                    # 'TMPD2023bvjpplus',
                     'KPSMLDplus',
                     'DPSSMLDplus',
                     'PiGDMVEplus',
                     # 'KGDMVEplus',
-                    # 'chung2022scalarplus',  
+                    'TMPD2023bvjpplus',
+                    'chung2022scalarplus',  
                     # 'chung2022plus',  
-                    # 'Song2023plus',
+                    'Song2023plus',
                     ]
   else:
     raise NotImplementedError(f"SDE {config.training.sde} unknown.")
@@ -429,7 +431,7 @@ def get_superresolution_observation(rng, x, config, shape, method='square'):
   num_obs = jnp.size(y)
   y = flatten_vmap(y)
   x = flatten_vmap(x)
-  mask = None  # TODO
+  mask = None
   return x, y, mask, num_obs
 
 
@@ -551,7 +553,7 @@ def plot_samples(x, image_size=32, num_channels=3, fname="samples", grayscale=Fa
       plt.imshow(img, cmap='gray', vmin=.0, vmax=1.)
     plt.imshow(img, interpolation=None)
     plt.savefig(fname + '.png', bbox_inches='tight', pad_inches=0.0)
-    plt.savefig(fname + '.pdf', bbox_inches='tight', pad_inches=0.0)
+    # plt.savefig(fname + '.pdf', bbox_inches='tight', pad_inches=0.0)
     plt.close()
 
 
@@ -585,11 +587,11 @@ def plot(train_data, mean, std, xlabel='x', ylabel='y',
 
 
 def compute_metrics_inner(config, cs_method, eval_path, x, y, q_samples,
-                          data_pools, inception_model,
+                          data_pools, inception_model, inceptionv3,
                           compute_lpips=True, save=True):
+  """Assumes images (x, y, q_samples) are all in the same space with range [0., 1.]."""
+  samples = np.clip(q_samples * 255., 0, 255).astype(np.uint8)
   uint8_samples = np.clip(q_samples * 255., 0, 255).astype(np.uint8)
-  # Use inceptionV3 for images with resolution higher than 256.
-  inceptionv3 = config.data.image_size >= 256
   # LPIPS - Need to permute and rescale to calculate correctly
   if compute_lpips: loss_fn_vgg = lpips.LPIPS(net='vgg')
   # Evaluate FID scores
@@ -635,32 +637,34 @@ def compute_metrics_inner(config, cs_method, eval_path, x, y, q_samples,
 
   logging.info("tmp_pool_3.shape: {}".format(tmp_pool_3.shape))
   # must have rank 2 to calculate distribution distances
-  if tmp_pool_3.shape[0] > 1:
+  if tmp_pool_3.shape[0] > 1 and compute_lpips:
     # Compute FID/KID/IS on individual inverse problem
     if not inceptionv3:
       _inception_score = tfgan.eval.classifier_score_from_logits(tmp_logits)
       stable_inception_score = tfgan.eval.classifier_score_from_logits(tmp_logits[idx])
     else:
       _inception_score = -1
-    _fid = tfgan.eval.frechet_classifier_distance_from_activations(
-      data_pools, tmp_pool_3)
-    stable_fid = tfgan.eval.frechet_classifier_distance_from_activations(
-      data_pools, tmp_pool_3[idx])
-    # Hack to get tfgan KID work for eager execution.
-    _tf_data_pools = tf.convert_to_tensor(data_pools)
-    _tf_tmp_pools = tf.convert_to_tensor(tmp_pool_3)
-    stable_tf_tmp_pools = tf.convert_to_tensor(tmp_pool_3[idx])
-    _kid = tfgan.eval.kernel_classifier_distance_from_activations(
-      _tf_data_pools, _tf_tmp_pools).numpy()
-    stable_kid = tfgan.eval.kernel_classifier_distance_from_activations(
-      _tf_data_pools, stable_tf_tmp_pools).numpy()
-    del _tf_data_pools, _tf_tmp_pools, stable_tf_tmp_pools
+    if data_pools is not None:
+      _fid = tfgan.eval.frechet_classifier_distance_from_activations(
+        data_pools, tmp_pool_3)
+      stable_fid = tfgan.eval.frechet_classifier_distance_from_activations(
+        data_pools, tmp_pool_3[idx])
+      # Hack to get tfgan KID work for eager execution.
+      _tf_data_pools = tf.convert_to_tensor(data_pools)
+      _tf_tmp_pools = tf.convert_to_tensor(tmp_pool_3)
+      stable_tf_tmp_pools = tf.convert_to_tensor(tmp_pool_3[idx])
+      _kid = tfgan.eval.kernel_classifier_distance_from_activations(
+        _tf_data_pools, _tf_tmp_pools).numpy()
+      stable_kid = tfgan.eval.kernel_classifier_distance_from_activations(
+        _tf_data_pools, stable_tf_tmp_pools).numpy()
+      del _tf_data_pools, _tf_tmp_pools, stable_tf_tmp_pools
+    else: raise ValueError("data pools was None")
 
     logging.info("cs_method-{} - stable: {}, \
                   IS: {:6e}, FID: {:6e}, KID: {:6e}, \
                   SIS: {:6e}, SFID: {:6e}, SKID: {:6e}, \
-                  LPIPS {:6e}+/-{:3e}, PSNR: {:6e}+/-{:3e}, SSIM: {:6e}+/-{:3e}, MSE: {:6e}+/-{:3e}, \
-                  SLPIPS {:6e}+/-{:3e}, SPSNR: {:6e}+/-{:3e}, SSSIM: {:6e}+/-{:3e}, SMSE: {:6e}+/-{:3e}".format(
+                  LPIPS: {:6e}+/-{:3e}, PSNR: {:6e}+/-{:3e}, SSIM: {:6e}+/-{:3e}, MSE: {:6e}+/-{:3e}, \
+                  SLPIPS: {:6e}+/-{:3e}, SPSNR: {:6e}+/-{:3e}, SSSIM: {:6e}+/-{:3e}, SMSE: {:6e}+/-{:3e}".format(
         cs_method, fraction_stable, _inception_score, _fid, _kid,
         stable_inception_score, stable_fid, stable_kid,
         lpips_mean, lpips_std, psnr_mean, psnr_std, ssim_mean, ssim_std, mse_mean, mse_std,
@@ -669,7 +673,8 @@ def compute_metrics_inner(config, cs_method, eval_path, x, y, q_samples,
 
     if save: np.savez_compressed(
       eval_path + "_stats.npz",
-      x=q_samples, y=y, noise_std=config.sampling.noise_std,
+      x=x, y=y,
+      samples=q_samples, noise_std=config.sampling.noise_std,
       pool_3=tmp_pool_3, logits=tmp_logits,
       lpips=_lpips,
       psnr=_psnr,
@@ -696,7 +701,8 @@ def compute_metrics_inner(config, cs_method, eval_path, x, y, q_samples,
         ))
     if save: np.savez_compressed(
       eval_path + "_stats.npz",
-      x=q_samples, y=y, noise_std=config.sampling.noise_std,
+      x=x, y=y,
+      samples=q_samples, noise_std=config.sampling.noise_std,
       pool_3=tmp_pool_3, logits=tmp_logits,
       lpips=_lpips,
       psnr=_psnr,
@@ -928,7 +934,7 @@ def super_resolution(config, workdir, eval_folder="eval"):
   obs_shape=(
     config.eval.batch_size, config.data.image_size//4, config.data.image_size//4, config.data.num_channels)
   method='nearest'  # 'bicubic'
-  num_sampling_rounds = 3
+  num_sampling_rounds = 10
 
   use_asset_sample = False
   if use_asset_sample:
@@ -1232,8 +1238,6 @@ def evaluate_inpainting(config,
   (num_devices, cs_methods, sde, inverse_scaler, scaler, epsilon_fn, score_fn, sampling_shape, rng
     ) = _setup(config, workdir, eval_folder)
 
-  num_sampling_rounds = 2
-
   # Use inceptionV3 for images with resolution higher than 256.
   inceptionv3 = config.data.image_size >= 256
   inception_model = get_inception_model(inceptionv3=inceptionv3)
@@ -1241,90 +1245,46 @@ def evaluate_inpainting(config,
   data_stats = load_dataset_stats(config)
   data_pools = data_stats["pool_3"]
 
-  use_SS = False
-  use_asset_sample = False
+  num_eval = 1000
+  eval_ds = get_eval_dataset(scaler, config, num_devices)
+  eval_iter = iter(eval_ds)
 
-  if not use_SS:
-    num_eval = 1000
-    if not use_asset_sample:
-      eval_ds = get_eval_dataset(scaler, config, num_devices)
-      eval_iter = iter(eval_ds)
+  # TODO: can tree_map be used to pmap across observation data?
+  for i, batch in enumerate(eval_iter):
+    if i == num_eval//config.eval.batch_size: break  # Only evaluate on first num_eval samples
+    eval_batch = jax.tree_map(lambda x: scaler(x._numpy()), batch)  # pylint: disable=protected-access
+    x = eval_batch['image'][0]
+    # x = get_eval_sample(scaler, config, num_devices)
+    _, y, mask, num_obs = get_inpainting_observation(rng, x, config, mask_name='half')
 
-      # TODO: can tree_map be used to pmap across observation data?
-      for i, batch in enumerate(eval_iter):
-        if i == num_eval//config.eval.batch_size: break  # Only evaluate on first num_eval samples
-        x = get_eval_sample(scaler, config, num_devices)
-        _, y, mask, num_obs = get_inpainting_observation(rng, x, config, mask_name='square')
+    _plot_ground_observed(x.copy(), y.copy(), x.shape, eval_folder, inverse_scaler, config, i)
 
-        _plot_ground_observed(x.copy(), y.copy(), x.shape, eval_folder, inverse_scaler, config, i)
+    if 'plus' not in config.sampling.cs_method:
+      logging.warning(
+        "Using full H matrix H.shape={} which may be too large to fit in memory ".format(
+          (num_obs, config.data.image_size**2 * config.data.num_channels)))
+      idx_obs = np.nonzero(mask)[0]
+      H = jnp.zeros((num_obs, config.data.image_size**2 * config.data.num_channels))
+      ogrid = np.arange(num_obs, dtype=int)
+      H = H.at[ogrid, idx_obs].set(1.0)
+      y = H @ y
 
-        if 'plus' not in config.sampling.cs_method:
-          logging.warning(
-            "Using full H matrix H.shape={} which may be too large to fit in memory ".format(
-              (num_obs, config.data.image_size**2 * config.data.num_channels)))
-          idx_obs = np.nonzero(mask)[0]
-          H = jnp.zeros((num_obs, config.data.image_size**2 * config.data.num_channels))
-          ogrid = np.arange(num_obs, dtype=int)
-          H = H.at[ogrid, idx_obs].set(1.0)
-          y = H @ y
-
-          def observation_map(x):
-              x = x.flatten()
-              return H @ x
-          adjoint_observation_map = None
-        else:
-          y = y
-          def observation_map(x):
-              x = x.flatten()
-              return mask * x
-          adjoint_observation_map = None
-          H = None
-
-        _sample(i, config, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling_shape,
-              inverse_scaler, y, H, observation_map, adjoint_observation_map, rng,
-                compute_metrics=(x, data_pools, inception_model))
+      def observation_map(x):
+          x = x.flatten()
+          return H @ x
+      adjoint_observation_map = None
     else:
-      raise NotImplementedError
+      y = y
+      def observation_map(x):
+          x = x.flatten()
+          return mask * x
+      adjoint_observation_map = None
+      H = None
 
-  else:
-    # TODO: This is SuperSeded
-
-    if use_asset_sample:
-      x = get_asset_sample(config)
-
-    for i in range(num_sampling_rounds):
-      if not use_asset_sample:
-        x = get_eval_sample(scaler, config, num_devices)
-        # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, sampling_shape, config)
-      _, y, mask, num_obs = get_inpainting_observation(rng, x, config, mask_name='square')
-
-      _plot_ground_observed(x.copy(), y.copy(), x.shape, eval_folder, inverse_scaler, config, i)
-
-      if 'plus' not in config.sampling.cs_method:
-        logging.warning(
-          "Using full H matrix H.shape={} which may be too large to fit in memory ".format(
-            (num_obs, config.data.image_size**2 * config.data.num_channels)))
-        idx_obs = np.nonzero(mask)[0]
-        H = jnp.zeros((num_obs, config.data.image_size**2 * config.data.num_channels))
-        ogrid = np.arange(num_obs, dtype=int)
-        H = H.at[ogrid, idx_obs].set(1.0)
-        y = H @ y
-
-        def observation_map(x):
-            x = x.flatten()
-            return H @ x
-        adjoint_observation_map = None
-      else:
-        y = y
-        def observation_map(x):
-            x = x.flatten()
-            return mask * x
-        adjoint_observation_map = None
-        H = None
-
-      _sample(i, config, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling_shape,
-            inverse_scaler, y, H, observation_map, adjoint_observation_map, rng,
-              compute_metrics=(x, data_pools, inception_model))
+    _sample(i, config, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling_shape,
+          inverse_scaler, y, H, observation_map, adjoint_observation_map, rng,
+            compute_metrics=(x, data_pools, inception_model, inceptionv3))
+    logging.info("samples: {}/{}".format(i * config.eval.batch_size, num_eval))
 
   compute_metrics(config, cs_methods, eval_folder)
 
@@ -1344,96 +1304,98 @@ def evaluate_super_resolution(config,
     ) = _setup(config, workdir, eval_folder)
 
   # Use inceptionV3 for images with resolution higher than 256.
+  # inceptionv3 = config.data.image_size >= 256
+  inceptionv3 = False
+  inception_model = get_inception_model(inceptionv3=inceptionv3)
+  # Load pre-computed dataset statistics.
+  if config.data.dataset == 'FFHQ':
+    data_stats = None
+    data_pools = None
+  else:
+    data_stats = load_dataset_stats(config)
+    data_pools = data_stats["pool_3"]
+
+  num_down_sample = 4
+  obs_shape=(
+    config.eval.batch_size, config.data.image_size//num_down_sample,
+    config.data.image_size//num_down_sample, config.data.num_channels)
+  method='bicubic'
+  # method='nearest'
+
+  num_eval = 1000
+  eval_ds = get_eval_dataset(scaler, config, num_devices)
+  eval_iter = iter(eval_ds)
+  # TODO: can tree_map be used to pmap across observation data?
+  for i, batch in enumerate(eval_iter):
+    if i == num_eval//config.eval.batch_size: break  # Only evaluate on first num_eval samples
+    eval_batch = jax.tree_map(lambda x: scaler(x._numpy()), batch)  # pylint: disable=protected-access
+    x = eval_batch['image'][0]
+    _, y, *_ = get_superresolution_observation(
+      rng, x, config,
+      shape=obs_shape,
+      method=method)
+
+    _plot_ground_observed(x.copy(), y.copy(), obs_shape, eval_folder, inverse_scaler, config, i)
+
+    def observation_map(x):
+      x = x.reshape(sampling_shape[1:])
+      y = jax.image.resize(x, obs_shape[1:], method)
+      return y.flatten()
+
+    def adjoint_observation_map(y):
+      y = y.reshape(obs_shape[1:])
+      x = jax.image.resize(y, sampling_shape[1:], method)
+      return x.flatten()
+
+    H = None
+
+    _sample(i, config, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling_shape,
+          inverse_scaler, y, H, observation_map, adjoint_observation_map, rng,
+            compute_metrics=(x, data_pools, inception_model, inceptionv3))
+    logging.info("samples: {}/{}".format(i * config.eval.batch_size, num_eval))
+
+  compute_metrics(config, cs_methods, eval_folder)
+
+
+def evaluate_from_file(config, workdir, eval_folder="eval"):
+  cs_methods, _ = get_sde(config)
+  compute_metrics(config, cs_methods, eval_folder)
+
+
+def revaluate_from_file(config, workdir, eval_folder="eval"):
+  cs_methods, _ = get_sde(config)
+
+  # Use inceptionV3 for images with resolution higher than 256.
   inceptionv3 = config.data.image_size >= 256
   inception_model = get_inception_model(inceptionv3=inceptionv3)
   # Load pre-computed dataset statistics.
   data_stats = load_dataset_stats(config)
   data_pools = data_stats["pool_3"]
 
-  num_down_sample = 4
-  obs_shape=(
-    config.eval.batch_size, config.data.image_size//num_down_sample,
-    config.data.image_size//num_down_sample, config.data.num_channels)
-  method='bicubic'  # 'bicubic'
+  for cs_method in cs_methods:
+    config.sampling.cs_method = cs_method
+    eval_file = "{}_{}_{}".format(
+      config.sampling.noise_std, config.data.dataset, config.sampling.cs_method.lower())  # NEW
+    stats = tf.io.gfile.glob(os.path.join(eval_folder, eval_file + "_*_stats.npz"))
 
-  use_SS = False
-  use_asset_sample = False
+    logging.info("stats path: {}, length stats: {}".format(
+      os.path.join(eval_folder, eval_file + "_*_stats.npz"), len(stats)))
 
-  if not use_SS:
-    num_eval = 10000
-    if not use_asset_sample:
-      eval_ds = get_eval_dataset(scaler, config, num_devices)
-      eval_iter = iter(eval_ds)
-      # TODO: can tree_map be used to pmap across observation data?
-      for i, batch in enumerate(eval_iter):
-        if i <= 25: continue
-        if i == num_eval//config.eval.batch_size: break  # Only evaluate on first num_eval samples
-        eval_batch = jax.tree_map(lambda x: scaler(x._numpy()), batch)  # pylint: disable=protected-access
-        x = eval_batch['image'][0]
-        _, y, *_ = get_superresolution_observation(
-          rng, x, config,
-          shape=obs_shape,
-          method=method)
+    for stat_file in stats:
+      with tf.io.gfile.GFile(stat_file, "rb") as fin:
+        stat = np.load(fin)
+        x = stat["x"]
+        y = stat["y"]
+        q_samples = stat["samples"]
 
-        _plot_ground_observed(x.copy(), y.copy(), obs_shape, eval_folder, inverse_scaler, config, i)
+        eval_file = "{}_{}_{}_{}".format(
+          config.sampling.noise_std, config.data.dataset, config.sampling.cs_method.lower(), -1)
+        eval_path = eval_folder + eval_file
+        compute_metrics_inner(config, cs_method, eval_path,
+                              # inverse_scaler(x), inverse_scaler(y), q_samples,
+                              x, y, q_samples,
+                              data_pools, inception_model, inceptionv3, compute_lpips=True, save=False)
 
-        def observation_map(x):
-          x = x.reshape(sampling_shape[1:])
-          y = jax.image.resize(x, obs_shape[1:], method)
-          return y.flatten()
-
-        def adjoint_observation_map(y):
-          y = y.reshape(obs_shape[1:])
-          x = jax.image.resize(y, sampling_shape[1:], method)
-          return x.flatten()
-
-        H = None
-
-        _sample(i, config, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling_shape,
-              inverse_scaler, y, H, observation_map, adjoint_observation_map, rng,
-                compute_metrics=(x, data_pools, inception_model))
-    else:
-      raise NotImplementedError
-  else:
-    # TODO: This is Superseded
-    num_sampling_rounds = 6
-    if use_asset_sample:
-      x = get_asset_sample(config)
-
-    for i in range(num_sampling_rounds):
-      if not use_asset_sample:
-        x = get_eval_sample(scaler, config, num_devices)
-        # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, sampling_shape, config)
-      _, y, *_ = get_superresolution_observation(
-        rng, x, config,
-        shape=obs_shape,
-        method=method)
-
-      _plot_ground_observed(x.copy(), y.copy(), obs_shape, eval_folder, inverse_scaler, config, i)
-
-      def observation_map(x):
-        x = x.reshape(sampling_shape[1:])
-        y = jax.image.resize(x, obs_shape[1:], method)
-        return y.flatten()
-
-      def adjoint_observation_map(y):
-        y = y.reshape(obs_shape[1:])
-        x = jax.image.resize(y, sampling_shape[1:], method)
-        return x.flatten()
-
-      H = None
-
-      _sample(i, config, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling_shape,
-            inverse_scaler, y, H, observation_map, adjoint_observation_map, rng,
-              compute_metrics=(x, data_pools, inception_model))
-
-  compute_metrics(config, cs_methods, eval_folder)
-
-
-def evaluate_from_file(config,
-                   workdir,
-                   eval_folder="eval"):
-  cs_methods, _ = get_sde(config)
   compute_metrics(config, cs_methods, eval_folder)
 
 
@@ -1447,7 +1409,7 @@ def dps_search_inpainting(
 
   cs_methods = _dps_method(config)
 
-  num_sampling_rounds = 10
+  num_sampling_rounds = 5
 
   # Use inceptionV3 for images with resolution higher than 256.
   inceptionv3 = config.data.image_size >= 256
@@ -1472,7 +1434,7 @@ def dps_search_inpainting(
   elif not use_asset_sample:
     x = get_eval_sample(scaler, config, num_devices)
     # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, sampling_shape, config)
-  _, y, mask, num_obs = get_inpainting_observation(rng, x, config, mask_name='square')
+  _, y, mask, num_obs = get_inpainting_observation(rng, x, config, mask_name='half')
   _plot_ground_observed(x.copy(), y.copy(), x.shape, eval_folder, inverse_scaler, config, 0,
                         search=True)
 
@@ -1505,7 +1467,8 @@ def dps_search_inpainting(
     (psnr_mean, psnr_std), (lpips_mean, lpips_std), (mse_mean, mse_std), (ssim_mean, ssim_std) = _sample(
       scale, config, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling_shape,
       inverse_scaler, y, H, observation_map, adjoint_observation_map, rng,
-      compute_metrics=(x, data_pools, inception_model), search=True)[0]
+      compute_metrics=(x, data_pools, inception_model, inceptionv3), search=True)[0]
+    logging.info("scale: {}".format(scale))
 
     psnr_means.append(psnr_mean)
     psnr_stds.append(psnr_std)
@@ -1540,7 +1503,7 @@ def dps_search_super_resolution(config,
 
   cs_methods = _dps_method(config)
 
-  num_sampling_rounds = 10
+  num_sampling_rounds = 5
 
   # Use inceptionV3 for images with resolution higher than 256.
   inceptionv3 = config.data.image_size >= 256
@@ -1550,8 +1513,8 @@ def dps_search_super_resolution(config,
   data_pools = data_stats["pool_3"]
 
   dps_hyperparameters = jnp.logspace(-1.5, 0.4, num=num_sampling_rounds, base=10.0)
-  dps_hyperparameters = jnp.logspace(-0.5, 1.4, num=num_sampling_rounds, base=10.0)
-  dps_hyperparameters = jnp.flip(dps_hyperparameters)
+  # dps_hyperparameters = jnp.logspace(-0.5, 1.4, num=num_sampling_rounds, base=10.0)
+  # dps_hyperparameters = jnp.flip(dps_hyperparameters)
   logging.info("dps_hyperparameters: {}".format(dps_hyperparameters))
 
   psnr_means = []
@@ -1563,11 +1526,11 @@ def dps_search_super_resolution(config,
   mse_means = []
   mse_stds = []
 
-  num_downscale = 4
+  num_downscale = 2
   obs_shape = (config.eval.batch_size, config.data.image_size//num_downscale,
                config.data.image_size//num_downscale, config.data.num_channels)
-  method = 'bicubic'
-  # method = 'nearest'
+  # method = 'bicubic'
+  method = 'nearest'
 
   use_asset_sample = False
   if use_asset_sample:
@@ -1603,7 +1566,8 @@ def dps_search_super_resolution(config,
     (psnr_mean, psnr_std), (lpips_mean, lpips_std), (mse_mean, mse_std), (ssim_mean, ssim_std) = _sample(
       scale, config, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling_shape,
       inverse_scaler, y, H, observation_map, adjoint_observation_map, rng,
-      compute_metrics=(x, data_pools, inception_model), search=True)[0]
+      compute_metrics=(x, data_pools, inception_model, inceptionv3), search=True)[0]
+    logging.info("scale: {}".format(scale))
 
     psnr_means.append(psnr_mean)
     psnr_stds.append(psnr_std)
