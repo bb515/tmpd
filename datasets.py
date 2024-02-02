@@ -154,7 +154,9 @@ def get_dataset(num_devices, config, additional_dim=None, uniform_dequantization
 
   elif config.data.dataset in ['FFHQ']:
     # dataset_builder = tf.data.tfrecorddataset(config.data.tfrecords_path)
-    dataset_builder = tfds.builder('ffhq/256')
+    # NOTE: new api has this name
+    dataset_builder = tf.data.TFRecordDataset(config.data.tfrecords_path)
+    # dataset_builder = tfds.builder('ffhq/256')
     train_split_name = eval_split_name = 'train'
 
   else:
@@ -207,6 +209,7 @@ def get_dataset(num_devices, config, additional_dim=None, uniform_dequantization
       ds = ds.batch(batch_size, drop_remainder=True)
     return ds.prefetch(prefetch_size)
 
-  train_ds = create_dataset(dataset_builder, train_split_name)
+  # train_ds = create_dataset(dataset_builder, train_split_name)  # can comment out when evaluating
+  train_ds = None
   eval_ds = create_dataset(dataset_builder, eval_split_name)
   return train_ds, eval_ds, dataset_builder

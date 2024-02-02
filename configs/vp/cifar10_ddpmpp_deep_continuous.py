@@ -70,14 +70,15 @@ def get_config():
   sampling.cs_method = 'TMPD2023bvjpplus'
   # sampling.cs_method = 'TMPD2023bvjp'
 
-  sampling.noise_std = 0.01
+  sampling.stack_samples = False
+  sampling.noise_std = 0.1
   sampling.denoise = True
   sampling.innovation = True
   sampling.inverse_scaler = None
   eval = config.eval
   eval.begin_ckpt = 8  # 12
   eval.end_ckpt = 8  # 12
-  eval.batch_size = 1
+  eval.batch_size = 100
   eval.pmap = False
   solver = config.solver
   # solver.outer_solver = 'eulermaruyama'
@@ -85,7 +86,27 @@ def get_config():
   solver.num_outer_steps = model.num_scales
   solver.eta = 1.0  # DDIM hyperparameter
 
-  solver.dps_scale_hyperparameter = 0.5
-  solver.mpgd_scale_hyperparameter = 0.
+  # solver.dps_scale_hyperparameter = 0.5
+  # solver.mpgd_scale_hyperparameter = 0.
+
+  # inpainting half
+  # solver.dps_scale_hyperparameter = 0.3  # for noise_std=0.01
+  # solver.dps_scale_hyperparameter = 0.3  # for noise_std=0.05
+  solver.dps_scale_hyperparameter = 0.3  # for noise_std=0.1
+
+  # inpainting square
+  # solver.dps_scale_hyperparameter = 0.3  # for noise_std=0.01
+  # solver.dps_scale_hyperparameter = 0.3  # for noise_std=0.05
+  # solver.dps_scale_hyperparameter = 0.3  # for noise_std=0.1
+
+  # superresolution 2nearest
+  # solver.dps_scale_hyperparameter = 0.8  # for noise_std=0.01
+  # solver.dps_scale_hyperparameter = 0.5  # for noise_std=0.05
+  # solver.dps_scale_hyperparameter = 0.3  # for noise_std=0.1
+
+  # superresolution 4bicubic
+  # solver.dps_scale_hyperparameter = 0.8  # for noise_std=0.01
+  # solver.dps_scale_hyperparameter = 0.5  # for noise_std=0.05
+  # solver.dps_scale_hyperparameter = 0.3  # for noise_std=0.1
 
   return config

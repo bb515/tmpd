@@ -12,18 +12,19 @@ import logging
 from flax.training import checkpoints
 # NOTE: Keep the import below for registering all model definitions
 from models import ddpm, ncsnv2, ncsnpp
+from models import utils as mutils
 import losses
 from evaluation import get_inception_model, load_dataset_stats, run_inception_distributed
-from models import utils as mutils
 import datasets
 from absl import flags
 FLAGS = flags.FLAGS
 from diffusionjax.sde import VP, VE
 from diffusionjax.solvers import EulerMaruyama
-from diffusionjax.utils import get_sampler, batch_matmul_A
+from diffusionjax.utils import get_sampler, batch_matmul_A, get_linear_beta_function, get_sigma_function
 from diffusionjax.run_lib import get_solver, get_markov_chain, get_ddim_chain
 from tmpd.samplers import get_cs_sampler
 from tmpd.inpainting import get_mask
+from tmpd.jpeg import jpeg_encode, jpeg_decode, get_patches_to_images
 from tmpd.plot import plot_animation
 import matplotlib.pyplot as plt
 from tensorflow.image import ssim as tf_ssim
@@ -36,7 +37,8 @@ from torchvision.datasets import VisionDataset
 import torchvision.transforms as transforms
 import torch
 import lpips
-import yaml
+# import yaml
+# from motionblur.motionblur import Kernel
 
 
 logging.basicConfig(filename=str(float(time.time())) + ".log",
@@ -50,11 +52,55 @@ flatten_vmap = vmap(lambda x: x.flatten())
 
 unconditional_ddim_methods = ['DDIMVE', 'DDIMVP', 'DDIMVEplus', 'DDIMVPplus']
 unconditional_markov_methods = ['DDIM', 'DDIMplus', 'SMLD', 'SMLDplus']
-ddim_methods = ['PiGDMVP', 'PiGDMVE', 'PiGDMVPplus', 'PiGDMVEplus',
+ddim_methods = ['ReproducePiGDMVP', 'PiGDMVP', 'PiGDMVE', 'PiGDMVPplus', 'PiGDMVEplus',
   'KGDMVP', 'KGDMVE', 'KGDMVPplus', 'KGDMVEplus']
 markov_methods = ['KPDDPM', 'KPDDPMplus', 'KPSMLD', 'KPSMLDplus']
 
 __DATASET__ = {}
+
+
+def _dps_method(config):
+  if config.training.sde.lower() == 'vpsde':
+    if 'plus' not in config.sampling.cs_method:
+      # VP/DDPM Methods with matrix H
+      # cs_method = 'chung2022scalar'
+      cs_method = 'DPSDDPM'
+    else:
+      # VP/DDM methods with mask
+      # cs_method = 'chung2022scalarplus'
+      cs_method = 'DPSDDPMplus'
+  elif config.training.sde.lower() == 'vesde':
+    if 'plus' not in config.sampling.cs_method:
+      # VE/SMLD Methods with matrix H
+      # cs_method = 'chung2022scalar'
+      cs_method = 'DPSSMLD'
+    else:
+      # cs_method = 'chung2022scalarplus'
+      cs_method = 'DPSSMLDplus'
+  return [cs_method]
+
+
+def _plot_ground_observed(x, y, obs_shape, eval_folder, inverse_scaler, config, i, search=False):
+  """Assume x, y are in the space of the diffusion model, so that x \in diffusion_model_space,
+  and inverse_scaler(x) \in [0., 1.]."""
+
+  if search :
+    eval_path = eval_folder + "/search_{}_".format(i)
+  else:
+    eval_path = eval_folder + "/_"
+
+  plot_samples(
+    inverse_scaler(x),
+    image_size=config.data.image_size,
+    num_channels=config.data.num_channels,
+    fname=eval_path + "{}_{}_ground_{}".format(
+      config.sampling.noise_std, config.data.dataset, i))
+  plot_samples(
+    inverse_scaler(y),
+    image_size=obs_shape[1],
+    num_channels=config.data.num_channels,
+    fname=eval_path + "{}_{}_observed_{}".format(
+      config.sampling.noise_std, config.data.dataset, i))
 
 
 def torch_lpips(loss_fn_vgg, x, samples):
@@ -63,6 +109,7 @@ def torch_lpips(loss_fn_vgg, x, samples):
   label = x.transpose(axes)
   delta = torch.from_numpy(np.array(delta))
   label = torch.from_numpy(np.array(label))
+  # Rescale to [-1., 1.]
   delta = delta * 2. - 1.
   label = label * 2. - 1.
   lpips = loss_fn_vgg(delta, label)
@@ -117,6 +164,117 @@ class FFHQDataset(VisionDataset):
         return img
 
 
+def _sample(i, config, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling_shape,
+            inverse_scaler, y, H, observation_map, adjoint_observation_map, rng,
+            compute_metrics=False, search=False):
+  """Assume x, y are in the space of the diffusion model, so that x \in diffusion_model_space,
+  and inverse_scaler(x) \in [0., 1.]."""
+  metrics = []
+  for cs_method in cs_methods:
+    config.sampling.cs_method = cs_method
+    if cs_method in ddim_methods:
+      sampler = get_cs_sampler(config, sde, epsilon_fn, sampling_shape, inverse_scaler,
+        y, H, observation_map, adjoint_observation_map, stack_samples=False)
+    else:
+      sampler = get_cs_sampler(config, sde, score_fn, sampling_shape, inverse_scaler,
+        y, H, observation_map, adjoint_observation_map, stack_samples=False)
+
+    rng, sample_rng = random.split(rng, 2)
+    if config.eval.pmap:
+      sampler = jax.pmap(sampler, axis_name='batch')
+      rng, *sample_rng = random.split(rng, jax.local_device_count() + 1)
+      sample_rng = jnp.asarray(sample_rng)
+    else:
+      rng, sample_rng = random.split(rng, 2)
+
+    time_prev = time.time()
+    # q_samples is in the space [0., 1.]
+    q_samples, _ = sampler(sample_rng)
+    sample_time = time.time() - time_prev
+
+    logging.info("{}: {}s".format(cs_method, sample_time))
+    if search:
+      eval_file = "search_{}_{}_{}_{}".format(
+        config.sampling.noise_std, config.data.dataset, config.sampling.cs_method.lower(), i)
+    else:
+      eval_file = "{}_{}_{}_{}".format(
+        config.sampling.noise_std, config.data.dataset, config.sampling.cs_method.lower(), i)
+    eval_path = eval_folder + eval_file
+    q_samples = q_samples.reshape((config.eval.batch_size,) + sampling_shape[1:])
+    plot_samples(
+      q_samples,
+      image_size=config.data.image_size,
+      num_channels=config.data.num_channels,
+      fname=eval_path)
+    if compute_metrics:
+      x, data_pools, inception_model, inceptionv3 = compute_metrics
+      save = not search
+      # NOTE: Take x and y from diffusion model space to \in [0., 1.], the space of q_samples
+      metrics.append(compute_metrics_inner(config, cs_method, eval_path,
+                            inverse_scaler(x), inverse_scaler(y), q_samples,
+                            data_pools, inception_model, inceptionv3, compute_lpips=True, save=save))
+  return metrics
+
+
+def _setup(config, workdir, eval_folder):
+  # jax.default_device = jax.devices()[0]
+  # Tip: use CUDA_VISIBLE_DEVICES to restrict the devices visible to jax
+  # ... they must be all the same model of device for pmap to work
+  num_devices =  int(jax.local_device_count()) if config.eval.pmap else 1
+
+  # Create directory to eval_folder
+  eval_dir = os.path.join(workdir, eval_folder)
+  tf.io.gfile.makedirs(eval_dir)
+
+  rng = random.PRNGKey(config.seed + 1)
+
+  # Initialize model
+  rng, model_rng = random.split(rng)
+  score_model, init_model_state, initial_params = mutils.init_model(model_rng, config, num_devices)
+  optimizer = losses.get_optimizer(config).create(initial_params)
+  state = mutils.State(step=0, optimizer=optimizer, lr=config.optim.lr,
+                       model_state=init_model_state,
+                       ema_rate=config.model.ema_rate,
+                       params_ema=initial_params,
+                       rng=rng)  # pytype: disable=wrong-keyword-args
+  checkpoint_dir = workdir
+  cs_methods, sde = get_sde(config)
+
+  # Create data normalizer and its inverse
+  scaler = datasets.get_data_scaler(config)
+  inverse_scaler = datasets.get_data_inverse_scaler(config)
+
+  # Get model state from checkpoint file
+  ckpt = config.eval.begin_ckpt
+  ckpt_filename = os.path.join(checkpoint_dir, "checkpoint_{}".format(ckpt))
+  if not tf.io.gfile.exists(ckpt_filename):
+    raise FileNotFoundError("{} does not exist".format(ckpt_filename))
+
+  state = checkpoints.restore_checkpoint(checkpoint_dir, state, step=ckpt)
+  epsilon_fn = mutils.get_epsilon_fn(
+    sde, score_model, state.params_ema, state.model_state, train=False, continuous=True)
+  score_fn = mutils.get_score_fn(
+    sde, score_model, state.params_ema, state.model_state, train=False, continuous=True)
+  batch_size = config.eval.batch_size
+  sampling_shape = (
+    config.eval.batch_size//num_devices,
+    config.data.image_size, config.data.image_size, config.data.num_channels)
+
+  logging.info("sampling shape: {},\nbatch_size={}".format(sampling_shape, batch_size))
+
+  # Create different random states for different hosts in a multi-host environment (e.g., TPU pods)
+  rng = random.fold_in(rng, jax.host_id())
+  return (num_devices,
+    cs_methods,
+    sde,
+    inverse_scaler,
+    scaler,
+    epsilon_fn,
+    score_fn,
+    sampling_shape,
+    rng)
+
+
 def get_asset_sample(config):
   # transform = transforms.Compose([transforms.ToTensor(),
   #                                 transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
@@ -126,14 +284,12 @@ def get_asset_sample(config):
                         transforms=transform)
   loader = get_dataloader(dataset, batch_size=3, num_workers=0, train=False)
   ref_img = next(iter(loader))
-  # print(ref_img.shape)
   ref_img = ref_img.detach().cpu().numpy()[2].transpose(1, 2, 0)
-  # print(np.max(ref_img), np.min(ref_img))
   ref_img = np.tile(ref_img, (config.eval.batch_size, 1, 1, 1))
   return ref_img
 
 
-def get_prior_sample(rng, score_fn, epsilon_fn, sde, inverse_scaler, sampling_shape, config, eval_folder):
+def get_prior_sample(rng, score_fn, epsilon_fn, sde, sampling_shape, config):
   if config.solver.outer_solver in unconditional_ddim_methods:
     outer_solver = get_ddim_chain(config, epsilon_fn)
   elif config.solver.outer_solver in unconditional_markov_methods:
@@ -153,18 +309,14 @@ def get_prior_sample(rng, score_fn, epsilon_fn, sde, inverse_scaler, sampling_sh
     rng, sample_rng = random.split(rng, 2)
 
   q_samples, _ = sampler(sample_rng)
-  # q_images = inverse_scaler(q_samples.copy())
-  q_samples = q_samples.reshape((config.eval.batch_size,) + sampling_shape[1:])
+  q_samples = q_samples.reshape(sampling_shape)
 
   return q_samples
 
 
 def get_eval_sample(scaler, config, num_devices):
-  # Build data pipeline
-  _, eval_ds, _ = datasets.get_dataset(num_devices,
-                                       config,
-                                       uniform_dequantization=config.data.uniform_dequantization,
-                                       evaluation=True)
+  eval_ds = get_eval_dataset(scaler, config, num_devices)
+  # get iterator over dataset
   eval_iter = iter(eval_ds)
   batch = next(eval_iter)
   # TODO: can tree_map be used to pmap across observation data?
@@ -172,32 +324,44 @@ def get_eval_sample(scaler, config, num_devices):
   return eval_batch['image'][0]
 
 
+def get_eval_dataset(scaler, config, num_devices):
+  # Build data pipeline
+  _, eval_ds, _ = datasets.get_dataset(num_devices,
+                                       config,
+                                       uniform_dequantization=config.data.uniform_dequantization,
+                                       evaluation=True)
+  return eval_ds
+
+
 def get_sde(config):
   # Setup SDEs
   if config.training.sde.lower() == 'vpsde':
-    sde = VP(beta_min=config.model.beta_min, beta_max=config.model.beta_max)
+    beta, log_mean_coeff = get_linear_beta_function(beta_min=config.model.beta_min, beta_max=config.model.beta_max)
+    sde = VP(beta, log_mean_coeff)
     if 'plus' not in config.sampling.cs_method:
       # VP/DDPM Methods with matrix H
       cs_methods = [
                     'KPDDPM',
                     'DPSDDPM',
-                    'PiGDMVP',
-                    'TMPD2023b',
-                    'Chung2022scalar',  
-                    'Song2023',
+                    # 'PiGDMVP',
+                    # 'TMPD2023b',
+                    # 'Chung2022scalar',  
+                    # 'Song2023',
                     ]
     else:
       # VP/DDM methods with mask
       cs_methods = [
                     'KPDDPMplus',
                     'DPSDDPMplus',
+                    # 'ReproducePiGDMVPplus',
                     'PiGDMVPplus',
                     'TMPD2023bvjpplus',
-                    'chung2022scalarplus',  
+                    'chung2022scalarplus',
                     'Song2023plus',
                     ]
   elif config.training.sde.lower() == 'vesde':
-    sde = VE(sigma_min=config.model.sigma_min, sigma_max=config.model.sigma_max)
+    sigma = get_sigma_function(sigma_min=config.model.sigma_min, sigma_max=config.model.sigma_max)
+    sde = VE(sigma)
     if 'plus' not in config.sampling.cs_method:
       # VE/SMLD Methods with matrix H
       cs_methods = [
@@ -214,27 +378,51 @@ def get_sde(config):
       # VE/SMLD methods with mask
       cs_methods = [
                     # 'KPSMLDdiag',
-                    # 'TMPD2023bvjpplus',
                     'KPSMLDplus',
                     'DPSSMLDplus',
                     'PiGDMVEplus',
-                    'KGDMVEplus',
-                    # 'chung2022scalarplus',  
+                    # 'KGDMVEplus',
+                    'TMPD2023bvjpplus',
+                    'chung2022scalarplus',  
                     # 'chung2022plus',  
-                    # 'Song2023plus',
+                    'Song2023plus',
                     ]
   else:
     raise NotImplementedError(f"SDE {config.training.sde} unknown.")
   return cs_methods, sde
 
 
+def get_jpeg_observation(rng, x, config, quality_factor=75.):
+  x_shape = x.shape
+  patches_to_image_luma, patches_to_image_chroma = get_patches_to_images(x_shape)
+  quality_factor = 75.
+  x = jnp.array(x)
+  X = jpeg_encode(x, quality_factor, patches_to_image_luma, patches_to_image_chroma, x_shape)
+  x = jpeg_decode(X, quality_factor, patches_to_image_luma, patches_to_image_chroma, x_shape)
+  y = x + random.normal(rng, x_shape) * config.sampling.noise_std
+  num_obs = jnp.size(y)
+  return x, y, (patches_to_image_luma, patches_to_image_chroma), num_obs
+
+
 def get_inpainting_observation(rng, x, config, mask_name='square'):
-  " mask_name in ['square', 'half', 'inverse_square', 'lorem3'"
+  "mask_name in ['square', 'half', 'inverse_square', 'lorem3'"
   x = flatten_vmap(x)
   mask, num_obs = get_mask(config.data.image_size, mask_name)
   y = x + random.normal(rng, x.shape) * config.sampling.noise_std
   y = y * mask
   return x, y, mask, num_obs
+
+
+def get_colorization_observation(rng, x, config):
+  " "
+  grayscale = jnp.array([0.299, 0.587, 0.114])
+  grayscale = grayscale.reshape(1, 1, 1, -1)
+  x = x * grayscale
+  x = jnp.sum(x, axis=3)
+  x = flatten_vmap(x)
+  y = x + random.normal(rng, x.shape) * config.sampling.noise_std
+  num_obs = x.size
+  return x, y, grayscale, num_obs
 
 
 def get_superresolution_observation(rng, x, config, shape, method='square'):
@@ -243,36 +431,108 @@ def get_superresolution_observation(rng, x, config, shape, method='square'):
   num_obs = jnp.size(y)
   y = flatten_vmap(y)
   x = flatten_vmap(x)
-  mask = None  # TODO
+  mask = None
   return x, y, mask, num_obs
 
 
-def get_blur_observation(rng, x, config, device=None):
-  from bkse.models.kernel_encoding.kernel_wizard import KernelWizard
+# class Blurkernel(nn.Module):
+#   def __init__(self, blur_type='gaussian', kernel_size=31, std=3., ):
+#     # Probably shouldn't use flax? depends on how new version is
+#     super().__init__()
+#     self.blur_type = blur_type
+#     self.kernel_size = kernel_size
+#     self.std = std
+#     self.weights_init()
 
-  def get_blur_model(opt_yml_path):
-    with open(opt_yml_path, "r") as f:
-      opt = yaml.safe_load(f)["KernelWizard"]
-      model_path = opt["pretrained"]
-    blur_model = KernelWizard(opt)
-    blur_model.eval()
-    blur_model.load_state_dict(torch.load(model_path))
-    # blur_model = blur_model.to(device)
-    return blur_model
+#   @nn.compact
+#   def __call__(self, x):
+#     x_shape = x.shape
+#     ndim = x.ndim
+#     n_hidden = x_shape[1]
 
-  opt_yml_path = './bkse/options/generate_blur/default.yml'
-  blur_model = get_blur_model(opt_yml_path)
+#     # not sure what the 3, 3 are for
+#     x = nn.Conv(x_shape[-1], 3, 3, (self.kernel_size,) * (ndim -2), stride=1, padding=0, bias=False, groups=3)(x)
+#     return x
 
-  def observation_map(x):
-    random_kernel = random.randn(1, config.image_size, 2, 2) * 1.2
-    # x = (x + 1.) / 2.  # do I need?
-    blurred = blur_model(x, kernel=random_kernel)
-    return blurred
+#   def weights_init(self):
+#     if self.blur_type == "gaussian":
+#       n = jnp.zeros((self.kernel_size, self.kernel_size))
+#       n[self.kernel_size // 2,self.kernel_size // 2] = 1
+#       k = scipy.ndimage.gaussian_filter(n, sigma=self.std)
+#       self.k = k
+#       for name, f in self.named_parameters():  #??
+#         f.data.copy_(k)
+#     elif self.blur_type == "motion":
+#       k = Kernel(size=(self.kernel_size, self.kernel_size), intensity=self.std).kernelMatrix
+#       self.k = k
+#       for name, f in self.named_parameters():
+#         f.data.copy_(k)
 
-  y = observation_map(x)
-  y = y + random.normal(rng, y.shape) * config.sampling.noise_std
-  num_obs = jnp.size(y)
-  return x, y, observation_map, num_obs
+
+# class NonlinearBlurOperator:
+#   def __init__(self, opt_yml_path):
+#     self.blur_model = self.prepare_nonlinear_blur_model(opt_yml_path)
+
+#   def prepare_nonlinear_blur_model(self, opt_yml_path):
+#     from bkse.models.kernel_encoding.kernel_wizard import KernelWizard
+
+#     with open(opt_yml_path, "r") as f:
+#       opt = yaml.safe_load(f)["KernelWizard"]
+#       model_path = opt["pretrained"]
+#     blur_model = KernelWizard(opt)
+#     blur_model.eval()
+#     blur_model.load_state_dict(torch.load(model_path))
+#     blur_model = blur_model.to(self.device)
+#     return blur_model
+
+#   def forward(self, data, **kwargs):
+#     random_kernel = torch.randn(1, 512, 2, 2).to(self.device) * 1.2
+#     data = (data + 1.0) / 2.0  #[-1, 1] -> [0, 1]
+#     blurred = self.blur_model.adaptKernel(data, kernel=random_kernel)
+#     blurred = (blurred * 2.0 - 1.0).clamp(-1, 1) #[0, 1] -> [-1, 1]
+#     return blurred
+
+
+# def get_gaussian_blur_observation(rng, x, config):
+#   """Linear blur model."""
+#   import scipy
+#   kernel_size = 100
+#   std = 100
+#   def blur_model():
+#     n = jnp.zeros((kernel_size, kernel_size))
+#     n[kernel_size // 2, kernel_size // 2] = 1
+#     k = scipy.ndimage.gaussian_filter(n, sigma=std)
+
+
+# def get_nonlinear_blur_observation(rng, x, config):
+#   """TODO: This is the non-linear blur model."""
+#   from bkse.models.kernel_encoding.kernel_wizard import KernelWizard
+
+#   def get_blur_model(opt_yml_path):
+#     with open(opt_yml_path, "r") as f:
+#       opt = yaml.safe_load(f)["KernelWizard"]
+#       model_path = opt["pretrained"]
+#     blur_model = KernelWizard(opt)
+#     blur_model.eval()
+#     print(model_path)
+#     assert 0
+#     blur_model.load_state_dict(torch.load(model_path))
+#     # blur_model = blur_model.to(device)
+#     return blur_model
+
+#   opt_yml_path = './bkse/options/generate_blur/default.yml'
+#   blur_model = get_blur_model(opt_yml_path)
+
+#   def observation_map(x):
+#     random_kernel = random.randn(1, config.image_size, 2, 2) * 1.2
+#     # x = (x + 1.) / 2.  # do I need?
+#     blurred = blur_model(x, kernel=random_kernel)
+#     return blurred
+
+#   y = observation_map(x)
+#   y = y + random.normal(rng, y.shape) * config.sampling.noise_std
+#   num_obs = jnp.size(y)
+#   return x, y, observation_map, num_obs
 
 
 def image_grid(x, image_size, num_channels):
@@ -282,14 +542,18 @@ def image_grid(x, image_size, num_channels):
     return img.reshape((w, w, image_size, image_size, num_channels)).transpose((0, 2, 1, 3, 4)).reshape((w * image_size, w * image_size, num_channels))
 
 
-def plot_samples(x, image_size=32, num_channels=3, fname="samples"):
+def plot_samples(x, image_size=32, num_channels=3, fname="samples", grayscale=False):
     img = image_grid(x, image_size, num_channels)
     plt.figure(figsize=(8,8))
     plt.axis('off')
     # NOTE: imshow resamples images so that the display image may not be the same resolution as the input
+    if not grayscale:
+      plt.imshow(img, interpolation=None)
+    else:
+      plt.imshow(img, cmap='gray', vmin=.0, vmax=1.)
     plt.imshow(img, interpolation=None)
     plt.savefig(fname + '.png', bbox_inches='tight', pad_inches=0.0)
-    plt.savefig(fname + '.pdf', bbox_inches='tight', pad_inches=0.0)
+    # plt.savefig(fname + '.pdf', bbox_inches='tight', pad_inches=0.0)
     plt.close()
 
 
@@ -322,17 +586,18 @@ def plot(train_data, mean, std, xlabel='x', ylabel='y',
   plt.close()
 
 
-def compute_metrics_inner(config, cs_method, eval_path, x, q_samples, data_pools, inception_model,
+def compute_metrics_inner(config, cs_method, eval_path, x, y, q_samples,
+                          data_pools, inception_model, inceptionv3,
                           compute_lpips=True, save=True):
+  """Assumes images (x, y, q_samples) are all in the same space with range [0., 1.]."""
   samples = np.clip(q_samples * 255., 0, 255).astype(np.uint8)
-  # Use inceptionV3 for images with resolution higher than 256.
-  inceptionv3 = config.data.image_size >= 256
+  uint8_samples = np.clip(q_samples * 255., 0, 255).astype(np.uint8)
   # LPIPS - Need to permute and rescale to calculate correctly
   if compute_lpips: loss_fn_vgg = lpips.LPIPS(net='vgg')
   # Evaluate FID scores
   # Force garbage collection before calling TensorFlow code for Inception network
   gc.collect()
-  latents = run_inception_distributed(samples, inception_model, inceptionv3=inceptionv3)
+  latents = run_inception_distributed(uint8_samples, inception_model, inceptionv3=inceptionv3)
   # Force garbage collection again before returning to JAX code
   gc.collect()
   # Save latent represents of the Inception network to disk
@@ -370,34 +635,36 @@ def compute_metrics_inner(config, cs_method, eval_path, x, q_samples, data_pools
   stable_mse_mean = np.mean(all_stable_mse)
   stable_mse_std = np.std(all_stable_mse)
 
-  print(tmp_pool_3.shape)
+  logging.info("tmp_pool_3.shape: {}".format(tmp_pool_3.shape))
   # must have rank 2 to calculate distribution distances
-  if tmp_pool_3.shape[0] > 1:
+  if tmp_pool_3.shape[0] > 1 and compute_lpips:
     # Compute FID/KID/IS on individual inverse problem
     if not inceptionv3:
       _inception_score = tfgan.eval.classifier_score_from_logits(tmp_logits)
       stable_inception_score = tfgan.eval.classifier_score_from_logits(tmp_logits[idx])
     else:
       _inception_score = -1
-    _fid = tfgan.eval.frechet_classifier_distance_from_activations(
-      data_pools, tmp_pool_3)
-    stable_fid = tfgan.eval.frechet_classifier_distance_from_activations(
-      data_pools, tmp_pool_3[idx])
-    # Hack to get tfgan KID work for eager execution.
-    _tf_data_pools = tf.convert_to_tensor(data_pools)
-    _tf_tmp_pools = tf.convert_to_tensor(tmp_pool_3)
-    stable_tf_tmp_pools = tf.convert_to_tensor(tmp_pool_3[idx])
-    _kid = tfgan.eval.kernel_classifier_distance_from_activations(
-      _tf_data_pools, _tf_tmp_pools).numpy()
-    stable_kid = tfgan.eval.kernel_classifier_distance_from_activations(
-      _tf_data_pools, stable_tf_tmp_pools).numpy()
-    del _tf_data_pools, _tf_tmp_pools, stable_tf_tmp_pools
+    if data_pools is not None:
+      _fid = tfgan.eval.frechet_classifier_distance_from_activations(
+        data_pools, tmp_pool_3)
+      stable_fid = tfgan.eval.frechet_classifier_distance_from_activations(
+        data_pools, tmp_pool_3[idx])
+      # Hack to get tfgan KID work for eager execution.
+      _tf_data_pools = tf.convert_to_tensor(data_pools)
+      _tf_tmp_pools = tf.convert_to_tensor(tmp_pool_3)
+      stable_tf_tmp_pools = tf.convert_to_tensor(tmp_pool_3[idx])
+      _kid = tfgan.eval.kernel_classifier_distance_from_activations(
+        _tf_data_pools, _tf_tmp_pools).numpy()
+      stable_kid = tfgan.eval.kernel_classifier_distance_from_activations(
+        _tf_data_pools, stable_tf_tmp_pools).numpy()
+      del _tf_data_pools, _tf_tmp_pools, stable_tf_tmp_pools
+    else: raise ValueError("data pools was None")
 
     logging.info("cs_method-{} - stable: {}, \
                   IS: {:6e}, FID: {:6e}, KID: {:6e}, \
                   SIS: {:6e}, SFID: {:6e}, SKID: {:6e}, \
-                  LPIPS {:6e}+/-{:3e}, PSNR: {:6e}+/-{:3e}, SSIM: {:6e}+/-{:3e}, MSE: {:6e}+/-{:3e}, \
-                  SLPIPS {:6e}+/-{:3e}, SPSNR: {:6e}+/-{:3e}, SSSIM: {:6e}+/-{:3e}, SMSE: {:6e}+/-{:3e}".format(
+                  LPIPS: {:6e}+/-{:3e}, PSNR: {:6e}+/-{:3e}, SSIM: {:6e}+/-{:3e}, MSE: {:6e}+/-{:3e}, \
+                  SLPIPS: {:6e}+/-{:3e}, SPSNR: {:6e}+/-{:3e}, SSSIM: {:6e}+/-{:3e}, SMSE: {:6e}+/-{:3e}".format(
         cs_method, fraction_stable, _inception_score, _fid, _kid,
         stable_inception_score, stable_fid, stable_kid,
         lpips_mean, lpips_std, psnr_mean, psnr_std, ssim_mean, ssim_std, mse_mean, mse_std,
@@ -406,6 +673,8 @@ def compute_metrics_inner(config, cs_method, eval_path, x, q_samples, data_pools
 
     if save: np.savez_compressed(
       eval_path + "_stats.npz",
+      x=x, y=y,
+      samples=q_samples, noise_std=config.sampling.noise_std,
       pool_3=tmp_pool_3, logits=tmp_logits,
       lpips=_lpips,
       psnr=_psnr,
@@ -432,6 +701,8 @@ def compute_metrics_inner(config, cs_method, eval_path, x, q_samples, data_pools
         ))
     if save: np.savez_compressed(
       eval_path + "_stats.npz",
+      x=x, y=y,
+      samples=q_samples, noise_std=config.sampling.noise_std,
       pool_3=tmp_pool_3, logits=tmp_logits,
       lpips=_lpips,
       psnr=_psnr,
@@ -469,8 +740,9 @@ def compute_metrics(config, cs_methods, eval_folder):
     all_mse = []
     stats = tf.io.gfile.glob(os.path.join(eval_folder, eval_file + "_*_stats.npz"))
     flag = 1
-    print(os.path.join(eval_folder, eval_file + "_*_stats.npz"))
-    print(len(stats), "len stats")
+
+    logging.info("stats path: {}, length stats: {}".format(
+      os.path.join(eval_folder, eval_file + "_*_stats.npz"), len(stats)))
 
     for stat_file in stats:
       with tf.io.gfile.GFile(stat_file, "rb") as fin:
@@ -488,13 +760,13 @@ def compute_metrics(config, cs_methods, eval_folder):
             all_mse.append(tmp_mse)
             all_ssim.append(tmp_ssim)
           except:
-            print("did not compute distance metrics")
+            logging.info("Did not compute distance metrics")
             flag = 0
 
         if not inceptionv3:
-          print(tmp_logits.shape)
+          logging.info("tmpd_logits.shape: {}, len(all_logits): {}".format(
+            tmp_logits.shape, len(all_logits)))
           all_logits.append(tmp_logits)
-          print(len(all_logits))
         all_pools.append(tmp_pools)
 
     if not inceptionv3:
@@ -518,7 +790,7 @@ def compute_metrics(config, cs_methods, eval_folder):
         all_ssim = np.array(all_ssim[0])
         all_mse = np.array(all_mse[0])
 
-    print("logits shape: ", all_logits.shape)
+    logging.info("logits shape: {}".format(all_logits.shape))
     if flag:
       lpips_mean = np.mean(all_lpips)
       lpips_std = np.std(all_lpips)
@@ -601,198 +873,91 @@ def compute_metrics(config, cs_methods, eval_folder):
         )
 
 
-def deblur(config, workdir, eval_folder="eval"):
-  jax.default_device = jax.devices()[0]
-  # Tip: use CUDA_VISIBLE_DEVICES to restrict the devices visible to jax
-  # ... they must be all the same model of device for pmap to work
-  num_devices =  int(jax.local_device_count()) if config.eval.pmap else 1
+# def deblur(config, workdir, eval_folder="eval"):
+#   (num_devices, cs_methods, sde, inverse_scaler, scaler, epsilon_fn, score_fn, sampling_shape, rng
+#     ) = _setup(config, workdir, eval_folder)
 
-  # Create directory to eval_folder
-  eval_dir = os.path.join(workdir, eval_folder)
-  tf.io.gfile.makedirs(eval_dir)
+#   obs_shape = (config.data.image_size, config.data.image_size, config.data.num_channels)
+#   num_sampling_rounds = 2
 
-  rng = random.PRNGKey(config.seed + 1)
+#   use_asset_sample = True
+#   if use_asset_sample:
+#     x = get_asset_sample(config)
+#   else:
+#     x = get_eval_sample(scaler, config, num_devices)
+  #   x = get_prior_sample(rng, score_fn, epsilon_fn, sde, sampling_shape, config)
+  # _, y, observation_map, _ = get_blur_observation(rng, x, config)
+  # _plot_ground_observed(x.copy(), y.copy(), obs_shape, eval_folder, inverse_scaler, config, 0)
+  # assert 0
 
-  # Initialize model
-  rng, model_rng = random.split(rng)
-  score_model, init_model_state, initial_params = mutils.init_model(model_rng, config, num_devices)
-  optimizer = losses.get_optimizer(config).create(initial_params)
-  state = mutils.State(step=0, optimizer=optimizer, lr=config.optim.lr,
-                       model_state=init_model_state,
-                       ema_rate=config.model.ema_rate,
-                       params_ema=initial_params,
-                       rng=rng)  # pytype: disable=wrong-keyword-args
-  checkpoint_dir = workdir
-  cs_methods, sde = get_sde(config)
+  # for i in range(num_sampling_rounds):
 
-  # Create different random states for different hosts in a multi-host environment (e.g., TPU pods)
-  rng = random.fold_in(rng, jax.host_id())
-  ckpt = config.eval.begin_ckpt
 
-  # Create data normalizer and its inverse
-  scaler = datasets.get_data_scaler(config)
-  inverse_scaler = datasets.get_data_inverse_scaler(config)
+  #   print(observation_map)
+  #   assert 0
+  #   adjoint_observation_map = None
 
-  # Get model state from checkpoint file
-  ckpt_filename = os.path.join(checkpoint_dir, "checkpoint_{}".format(ckpt))
-  if not tf.io.gfile.exists(ckpt_filename):
-    raise FileNotFoundError("{} does not exist".format(ckpt_filename))
-  state = checkpoints.restore_checkpoint(checkpoint_dir, state, step=ckpt)
-  epsilon_fn = mutils.get_epsilon_fn(
-    sde, score_model, state.params_ema, state.model_state, train=False, continuous=True)
-  score_fn = mutils.get_score_fn(
-    sde, score_model, state.params_ema, state.model_state, train=False, continuous=True)
-  batch_size = config.eval.batch_size
-  print("\nbatch_size={}".format(batch_size))
-  sampling_shape = (
-    config.eval.batch_size//num_devices,
-    config.data.image_size, config.data.image_size, config.data.num_channels)
-  print("sampling shape", sampling_shape)
-  obs_shape = (config.data.image_size//2, config.data.image_size//2, config.data.num_channels)
+  #   H = None
+  #   cs_method = config.sampling.cs_method
 
-  num_sampling_rounds = 2
-  for i in range(num_sampling_rounds):
-    x = get_eval_sample(scaler, inverse_scaler, config, eval_folder, num_devices)
-    # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, inverse_scaler, sampling_shape, config, eval_folder)
-    _, y, observation_map, _ = get_blur_observation(
-        rng, x, config)
+  #   for cs_method in cs_methods:
+  #     config.sampling.cs_method = cs_method
+  #     if cs_method in ddim_methods:
+  #       sampler = get_cs_sampler(config, sde, epsilon_fn, sampling_shape, inverse_scaler,
+  #         y, H, observation_map, adjoint_observation_map, stack_samples=False)
+  #     else:
+  #       sampler = get_cs_sampler(config, sde, score_fn, sampling_shape, inverse_scaler,
+  #         y, H, observation_map, adjoint_observation_map, stack_samples=False)
 
-    plot_samples(
-      inverse_scaler(x.copy()),
-      image_size=config.data.image_size,
-      num_channels=config.data.num_channels,
-      fname=eval_folder + "/_{}_ground_{}_{}".format(
-        config.data.dataset, config.solver.outer_solver, i))
-    plot_samples(
-      inverse_scaler(y.copy()),
-      image_size=obs_shape[1],
-      num_channels=config.data.num_channels,
-      fname=eval_folder + "/_{}_observed_{}_{}".format(
-        config.data.dataset, config.solver.outer_solver, i))
-    np.savez(eval_folder + "/{}_{}_ground_observed_{}.npz".format(
-      config.sampling.noise_std, config.data.dataset, i),
-      x=jnp.array(x), y=y, noise_std=config.sampling.noise_std)
-    print(observation_map)
-    assert 0
-    adjoint_observation_map = None
+  #     rng, sample_rng = random.split(rng, 2)
+  #     if config.eval.pmap:
+  #       # sampler = jax.pmap(sampler, axis_name='batch')
+  #       rng, *sample_rng = random.split(rng, jax.local_device_count() + 1)
+  #       sample_rng = jnp.asarray(sample_rng)
+  #     else:
+  #       rng, sample_rng = random.split(rng, 2)
 
-    H = None
-    cs_method = config.sampling.cs_method
-
-    for cs_method in cs_methods:
-      config.sampling.cs_method = cs_method
-      if cs_method in ddim_methods:
-        sampler = get_cs_sampler(config, sde, epsilon_fn, sampling_shape, inverse_scaler,
-          y, H, observation_map, adjoint_observation_map, stack_samples=False)
-      else:
-        sampler = get_cs_sampler(config, sde, score_fn, sampling_shape, inverse_scaler,
-          y, H, observation_map, adjoint_observation_map, stack_samples=False)
-
-      rng, sample_rng = random.split(rng, 2)
-      if config.eval.pmap:
-        # sampler = jax.pmap(sampler, axis_name='batch')
-        rng, *sample_rng = random.split(rng, jax.local_device_count() + 1)
-        sample_rng = jnp.asarray(sample_rng)
-      else:
-        rng, sample_rng = random.split(rng, 2)
-
-      q_samples, _ = sampler(sample_rng)
-      q_samples = q_samples.reshape((config.eval.batch_size,) + sampling_shape[1:])
-      print(q_samples, "\nconfig.sampling.cs_method")
-      plot_samples(
-        q_samples,
-        image_size=config.data.image_size,
-        num_channels=config.data.num_channels,
-        fname=eval_folder + "/{}_{}_{}_{}".format(config.data.dataset, config.sampling.noise_std, config.sampling.cs_method.lower(), i))
+  #     q_samples, _ = sampler(sample_rng)
+  #     q_samples = q_samples.reshape((config.eval.batch_size,) + sampling_shape[1:])
+  #     print(q_samples, "\nconfig.sampling.cs_method")
+  #     plot_samples(
+  #       q_samples,
+  #       image_size=config.data.image_size,
+  #       num_channels=config.data.num_channels,
+  #       fname=eval_folder + "/{}_{}_{}_{}".format(config.data.dataset, config.sampling.noise_std, config.sampling.cs_method.lower(), i))
 
 
 def super_resolution(config, workdir, eval_folder="eval"):
-  jax.default_device = jax.devices()[0]
-  # Tip: use CUDA_VISIBLE_DEVICES to restrict the devices visible to jax
-  # ... they must be all the same model of device for pmap to work
-  num_devices =  int(jax.local_device_count()) if config.eval.pmap else 1
-  # Create directory to eval_folder
-  eval_dir = os.path.join(workdir, eval_folder)
-  tf.io.gfile.makedirs(eval_dir)
-  rng = random.PRNGKey(config.seed + 1)
+  (num_devices, cs_methods, sde, inverse_scaler, scaler, epsilon_fn, score_fn, sampling_shape, rng
+    ) = _setup(config, workdir, eval_folder)
 
-  # Initialize model
-  rng, model_rng = random.split(rng)
-  score_model, init_model_state, initial_params = mutils.init_model(model_rng, config, num_devices)
-  optimizer = losses.get_optimizer(config).create(initial_params)
-  state = mutils.State(step=0, optimizer=optimizer, lr=config.optim.lr,
-                       model_state=init_model_state,
-                       ema_rate=config.model.ema_rate,
-                       params_ema=initial_params,
-                       rng=rng)  # pytype: disable=wrong-keyword-args
-
-  checkpoint_dir = workdir
-  cs_methods, sde = get_sde(config)
-  # Create different random states for different hosts in a multi-host environment (e.g., TPU pods)
-  rng = random.fold_in(rng, jax.host_id())
-  ckpt = config.eval.begin_ckpt
-  # Create data normalizer and its inverse
-
-  scaler = datasets.get_data_scaler(config)
-  inverse_scaler = datasets.get_data_inverse_scaler(config)
-
-  # Get model state from checkpoint file
-  ckpt_filename = os.path.join(checkpoint_dir, "checkpoint_{}".format(ckpt))
-  if not tf.io.gfile.exists(ckpt_filename):
-    raise FileNotFoundError("{} does not exist".format(ckpt_filename))
-
-  state = checkpoints.restore_checkpoint(checkpoint_dir, state, step=ckpt)
-  epsilon_fn = mutils.get_epsilon_fn(
-    sde, score_model, state.params_ema, state.model_state, train=False, continuous=True)
-  score_fn = mutils.get_score_fn(
-    sde, score_model, state.params_ema, state.model_state, train=False, continuous=True)
-  batch_size = config.eval.batch_size
-  print("\nbatch_size={}".format(batch_size))
-  sampling_shape = (
-    config.eval.batch_size//num_devices,
-    config.data.image_size, config.data.image_size, config.data.num_channels)
-  print("sampling shape", sampling_shape)
-  shape=(
+  obs_shape=(
     config.eval.batch_size, config.data.image_size//4, config.data.image_size//4, config.data.num_channels)
   method='nearest'  # 'bicubic'
-  num_sampling_rounds = 3
+  num_sampling_rounds = 10
 
-  x = get_asset_sample(config)
-  _, y, *_ = get_superresolution_observation(
-    rng, x, config,
-    shape=shape,
-    method=method)
+  use_asset_sample = False
+  if use_asset_sample:
+    x = get_asset_sample(config)
+
   for i in range(num_sampling_rounds):
-    # x = get_eval_sample(scaler, config, num_devices)
-    # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, inverse_scaler, sampling_shape, config, eval_folder)
-    # _, y, *_ = get_superresolution_observation(
-    #   rng, x, config,
-    #   shape=shape,
-    #   method=method)
-    plot_samples(
-      inverse_scaler(x.copy()),
-      image_size=config.data.image_size,
-      num_channels=config.data.num_channels,
-      fname=eval_folder + "/_{}_ground_{}_{}".format(
-        config.sampling.noise_std, config.data.dataset, i))
-    plot_samples(
-      inverse_scaler(y.copy()),
-      image_size=shape[1],
-      num_channels=config.data.num_channels,
-      fname=eval_folder + "/_{}_observed_{}_{}".format(
-        config.sampling.noise_std, config.data.dataset, i))
+    if not use_asset_sample:
+      x = get_eval_sample(scaler, config, num_devices)
+      # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, sampling_shape, config)
+    _, y, *_ = get_superresolution_observation(
+      rng, x, config,
+      shape=obs_shape,
+      method=method)
 
-    np.savez(eval_folder + "/{}_{}_ground_observed_{}.npz".format(
-      config.sampling.noise_std, config.data.dataset, i),
-      x=x, y=y, noise_std=config.sampling.noise_std)
+    _plot_ground_observed(x.copy(), y.copy(), obs_shape, eval_folder, inverse_scaler, config, i)
 
     def observation_map(x):
       x = x.reshape(sampling_shape[1:])
-      y = jax.image.resize(x, shape[1:], method)
+      y = jax.image.resize(x, obs_shape[1:], method)
       return y.flatten()
 
     def adjoint_observation_map(y):
-      y = y.reshape(shape[1:])
+      y = y.reshape(obs_shape[1:])
       x = jax.image.resize(y, sampling_shape[1:], method)
       return x.flatten()
 
@@ -819,11 +984,16 @@ def super_resolution(config, workdir, eval_folder="eval"):
       time_prev = time.time()
       q_samples, _ = sampler(sample_rng)
       sample_time = time.time() - time_prev
-      print("{}: {}s".format(cs_method, sample_time))
+
+      logging.info("{}: {}s".format(cs_methods, sample_time))
       if config.sampling.stack_samples:
         q_samples = q_samples.reshape(
           (config.solver.num_outer_steps, config.eval.batch_size,) + sampling_shape[1:])
         frames = 100
+
+        np.savez(eval_folder + "/{}_{}_{}_{}.npz".format(
+          config.sampling.noise_std, config.data.dataset, config.sampling.cs_method, i),
+          samples=q_samples)
 
         fig = plt.figure(figsize=[1,1])
         ax = fig.add_axes([0, 0, 1, 1])
@@ -834,11 +1004,11 @@ def super_resolution(config, workdir, eval_folder="eval"):
         img = image_grid(
           q_samples[-1],
           config.data.image_size, config.data.num_channels)
-        im = ax.imshow(img, interpolation=None)
+        ax.imshow(img, interpolation=None)
         fig.tight_layout()
         def animate(i, ax):
           ax.clear()
-          idx = 1000 - int((i + 1) * config.solver.num_outer_steps / frames)
+          idx = config.solver.num_outer_steps - int((i + 1) * config.solver.num_outer_steps / frames)
           img = image_grid(
             q_samples[idx],
             config.data.image_size, config.data.num_channels)
@@ -866,76 +1036,101 @@ def super_resolution(config, workdir, eval_folder="eval"):
           fname=eval_folder + "/{}_{}_{}_{}".format(config.data.dataset, config.sampling.noise_std, config.sampling.cs_method.lower(), i))
 
 
-def inpainting(config, workdir, eval_folder="eval"):
-  # Tip: use CUDA_VISIBLE_DEVICES to restrict the devices visible to jax
-  # ... they must be all the same model of device for pmap to work
-  num_devices =  int(jax.local_device_count()) if config.eval.pmap else 1
+def jpeg(config, workdir, eval_folder="eval"):
+  (num_devices, cs_methods, sde, inverse_scaler, scaler, epsilon_fn, score_fn, sampling_shape, rng
+    ) = _setup(config, workdir, eval_folder)
 
-  # Create directory to eval_folder
-  eval_dir = os.path.join(workdir, eval_folder)
-  tf.io.gfile.makedirs(eval_dir)
+  num_sampling_rounds = 2
+  quality_factor = 75.
 
-  rng = random.PRNGKey(config.seed + 1)
+  use_asset_sample = False
+  if use_asset_sample:
+    x = get_asset_sample(config)
 
-  # Initialize model
-  rng, model_rng = random.split(rng)
-  score_model, init_model_state, initial_params = mutils.init_model(model_rng, config, num_devices)
-  optimizer = losses.get_optimizer(config).create(initial_params)
-  state = mutils.State(step=0, optimizer=optimizer, lr=config.optim.lr,
-                       model_state=init_model_state,
-                       ema_rate=config.model.ema_rate,
-                       params_ema=initial_params,
-                       rng=rng)  # pytype: disable=wrong-keyword-args
-  checkpoint_dir = workdir
-  cs_methods, sde = get_sde(config)
+  for i in range(num_sampling_rounds):
+    if not use_asset_sample:
+      x = get_eval_sample(scaler, config, num_devices)
+      # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, sampling_shape, config)
 
-  # Create data normalizer and its inverse
-  # scaler = datasets.get_data_scaler(config)
-  inverse_scaler = datasets.get_data_inverse_scaler(config)
+    _, y, (patches_to_image_luma, patches_to_image_chroma), _ = get_jpeg_observation(
+      rng, x, config, quality_factor=quality_factor)
+    plot_samples(y, image_size=config.data.image_size, num_channels=config.data.num_channels,
+                 fname="test")
 
-  # Get model state from checkpoint file
-  ckpt = config.eval.begin_ckpt
-  ckpt_filename = os.path.join(checkpoint_dir, "checkpoint_{}".format(ckpt))
-  if not tf.io.gfile.exists(ckpt_filename):
-    raise FileNotFoundError("{} does not exist".format(ckpt_filename))
+    _plot_ground_observed(x.copy(), y.copy(), x.shape, eval_folder, inverse_scaler, config, i)
 
-  state = checkpoints.restore_checkpoint(checkpoint_dir, state, step=ckpt)
-  epsilon_fn = mutils.get_epsilon_fn(
-    sde, score_model, state.params_ema, state.model_state, train=False, continuous=True)
-  score_fn = mutils.get_score_fn(
-    sde, score_model, state.params_ema, state.model_state, train=False, continuous=True)
-  batch_size = config.eval.batch_size
-  print("\nbatch_size={}".format(batch_size))
-  sampling_shape = (
-    config.eval.batch_size//num_devices,
-    config.data.image_size, config.data.image_size, config.data.num_channels)
-  print("sampling shape", sampling_shape)
+    if 'plus' not in config.sampling.cs_method:
+      raise ValueError("Nonlinear observation map is not compatible.")
+    else:
+      def observation_map(x):
+        if x.ndim == 3: x = jnp.expand_dims(x, axis=0)
+        x_shape = x.shape
+        # TODO: it would make more sense if observation map was just an encoder
+        return jpeg_decode(jpeg_encode(x, quality_factor, patches_to_image_luma, patches_to_image_chroma, x_shape), quality_factor, patches_to_image_luma, patches_to_image_chroma, x_shape)
 
-  # Create different random states for different hosts in a multi-host environment (e.g., TPU pods)
-  rng = random.fold_in(rng, jax.host_id())
+      adjoint_observation_map = None
+      H = None
+      y_test = observation_map(jnp.array(x))
+      plot_samples(y_test, image_size=config.data.image_size, num_channels=config.data.num_channels,
+                  fname="test2")
+      assert 0
+
+    _sample(i, config, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling_shape,
+           inverse_scaler, y, H, observation_map, adjoint_observation_map, rng)
+
+
+def colorization(config, workdir, eval_folder="eval"):
+  (num_devices, cs_methods, sde, inverse_scaler, scaler, epsilon_fn, score_fn, sampling_shape, rng
+    ) = _setup(config, workdir, eval_folder)
+
   num_sampling_rounds = 2
 
-  x = get_asset_sample(config)
-  _, y, mask, num_obs = get_inpainting_observation(rng, x, config, mask_name='square')
+  use_asset_sample = False
+  if use_asset_sample:
+    x = get_asset_sample(config)
+
   for i in range(num_sampling_rounds):
-    # x = get_eval_sample(scaler, config, num_devices)
-    # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, inverse_scaler, sampling_shape, config, eval_folder)
-    # _, y, mask, num_obs = get_inpainting_observation(rng, x, config, mask_name='half')
-    plot_samples(
-      inverse_scaler(x.copy()),
-      image_size=config.data.image_size,
-      num_channels=config.data.num_channels,
-      fname=eval_folder + "/_{}_ground_{}_{}".format(
-        config.sampling.noise_std, config.data.dataset, i))
-    plot_samples(
-      inverse_scaler(y.copy()),
-      image_size=config.data.image_size,
-      num_channels=config.data.num_channels,
-      fname=eval_folder + "/_{}_observed_{}_{}".format(
-        config.sampling.noise_std, config.data.dataset, i))
-    np.savez(eval_folder + "/{}_{}_ground_observed_{}.npz".format(
-      config.sampling.noise_std, config.data.dataset, i),
-      x=x, y=y, noise_std=config.sampling.noise_std)
+    if not use_asset_sample:
+      x = get_eval_sample(scaler, config, num_devices)
+      # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, sampling_shape, config)
+    _, y, _, _ = get_colorization_observation(rng, x, config)
+
+    _plot_ground_observed(x.copy(), y.copy(), x.shape, eval_folder, inverse_scaler, config, i)
+
+    if 'plus' not in config.sampling.cs_method:
+      raise NotImplementedError
+    else:
+      def observation_map(x):
+        grayscale = jnp.array([0.299, 0.587, 0.114])
+        grayscale = grayscale.reshape(1, 1, 1, -1)
+        x = x * grayscale
+        x = jnp.sum(x, axis=3)
+        return x.flatten()
+
+      adjoint_observation_map = None
+      H = None
+
+    _sample(i, config, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling_shape,
+            inverse_scaler, y, H, observation_map, adjoint_observation_map, rng)
+
+
+def inpainting(config, workdir, eval_folder="eval"):
+  (num_devices, cs_methods, sde, inverse_scaler, scaler, epsilon_fn, score_fn, sampling_shape, rng
+    ) = _setup(config, workdir, eval_folder)
+
+  num_sampling_rounds = 2
+
+  use_asset_sample = False
+  if use_asset_sample:
+    x = get_asset_sample(config)
+
+  for i in range(num_sampling_rounds):
+    if not use_asset_sample:
+      x = get_eval_sample(scaler, config, num_devices)
+      # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, sampling_shape, config)
+    _, y, mask, num_obs = get_inpainting_observation(rng, x, config, mask_name='half')
+
+    _plot_ground_observed(x.copy(), y.copy(), x.shape, eval_folder, inverse_scaler, config, i)
 
     if 'plus' not in config.sampling.cs_method:
       logging.warning(
@@ -955,36 +1150,12 @@ def inpainting(config, workdir, eval_folder="eval"):
       def observation_map(x):
           x = x.flatten()
           return mask * x
+
       adjoint_observation_map = None
       H = None
 
-    for cs_method in cs_methods:
-      config.sampling.cs_method = cs_method
-      if cs_method in ddim_methods:
-        sampler = get_cs_sampler(config, sde, epsilon_fn, sampling_shape, inverse_scaler,
-          y, H, observation_map, adjoint_observation_map, stack_samples=False)
-      else:
-        sampler = get_cs_sampler(config, sde, score_fn, sampling_shape, inverse_scaler,
-          y, H, observation_map, adjoint_observation_map, stack_samples=False)
-
-      rng, sample_rng = random.split(rng, 2)
-      if config.eval.pmap:
-        sampler = jax.pmap(sampler, axis_name='batch')
-        rng, *sample_rng = random.split(rng, jax.local_device_count() + 1)
-        sample_rng = jnp.asarray(sample_rng)
-      else:
-        rng, sample_rng = random.split(rng, 2)
-
-      time_prev = time.time()
-      q_samples, _ = sampler(sample_rng)
-      sample_time = time.time() - time_prev
-      print("{}: {}s".format(cs_method, sample_time))
-      q_samples = q_samples.reshape((config.eval.batch_size,) + sampling_shape[1:])
-      plot_samples(
-        q_samples,
-        image_size=config.data.image_size,
-        num_channels=config.data.num_channels,
-        fname=eval_folder + "/{}_{}_{}_{}".format(config.sampling.noise_std, config.data.dataset, config.sampling.cs_method.lower(), i))
+    _sample(i, config, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling_shape,
+            inverse_scaler, y, H, observation_map, adjoint_observation_map, rng)
 
 
 def sample(config,
@@ -1043,7 +1214,8 @@ def sample(config,
     (4, config.data.image_size, config.data.image_size, config.data.num_channels),
     EulerMaruyama(sde.reverse(score_fn), num_steps=config.model.num_scales))
   q_samples, num_function_evaluations = sampler(rng)
-  print("num_function_evaluations", num_function_evaluations)
+
+  logging.info("num_function_evaluations: {}".format(num_function_evaluations))
   q_samples = inverse_scaler(q_samples)
   plot_samples(
     q_samples,
@@ -1063,58 +1235,8 @@ def evaluate_inpainting(config,
     eval_folder: The subfolder for storing evaluation results. Default to
       "eval".
   """
-  # Tip: use CUDA_VISIBLE_DEVICES to restrict the devices visible to jax
-  # ... they must be all the same model of device for pmap to work
-  num_devices =  int(jax.local_device_count()) if config.eval.pmap else 1
-
-  # Create directory to eval_folder
-  eval_dir = os.path.join(workdir, eval_folder)
-  tf.io.gfile.makedirs(eval_dir)
-
-  rng = random.PRNGKey(config.seed + 1)
-
-  # Create data normalizer and its inverse
-  scaler = datasets.get_data_scaler(config)
-  inverse_scaler = datasets.get_data_inverse_scaler(config)
-
-  # Initialize model
-  rng, model_rng = random.split(rng)
-  score_model, init_model_state, initial_params = mutils.init_model(model_rng, config, num_devices)
-  optimizer = losses.get_optimizer(config).create(initial_params)
-  state = mutils.State(step=0, optimizer=optimizer, lr=config.optim.lr,
-                       model_state=init_model_state,
-                       ema_rate=config.model.ema_rate,
-                       params_ema=initial_params,
-                       rng=rng)  # pytype: disable=wrong-keyword-args
-
-  checkpoint_dir = workdir
-  cs_methods, sde = get_sde(config)
-
-  # Create data normalizer and its inverse
-  scaler = datasets.get_data_scaler(config)
-  inverse_scaler = datasets.get_data_inverse_scaler(config)
-
-  # Get model state from checkpoint file
-  ckpt = config.eval.begin_ckpt
-  ckpt_filename = os.path.join(checkpoint_dir, "checkpoint_{}".format(ckpt))
-  if not tf.io.gfile.exists(ckpt_filename):
-    raise FileNotFoundError("{} does not exist".format(ckpt_filename))
-
-  state = checkpoints.restore_checkpoint(checkpoint_dir, state, step=ckpt)
-  epsilon_fn = mutils.get_epsilon_fn(
-    sde, score_model, state.params_ema, state.model_state, train=False, continuous=True)
-  score_fn = mutils.get_score_fn(
-    sde, score_model, state.params_ema, state.model_state, train=False, continuous=True)
-  batch_size = config.eval.batch_size
-  print("\nbatch_size={}".format(batch_size))
-  sampling_shape = (
-    config.eval.batch_size//num_devices,
-    config.data.image_size, config.data.image_size, config.data.num_channels)
-  print("sampling shape", sampling_shape)
-
-  # Create different random states for different hosts in a multi-host environment (e.g., TPU pods)
-  rng = random.fold_in(rng, jax.host_id())
-  num_sampling_rounds = 2
+  (num_devices, cs_methods, sde, inverse_scaler, scaler, epsilon_fn, score_fn, sampling_shape, rng
+    ) = _setup(config, workdir, eval_folder)
 
   # Use inceptionV3 for images with resolution higher than 256.
   inceptionv3 = config.data.image_size >= 256
@@ -1122,26 +1244,20 @@ def evaluate_inpainting(config,
   # Load pre-computed dataset statistics.
   data_stats = load_dataset_stats(config)
   data_pools = data_stats["pool_3"]
-  for i in range(num_sampling_rounds):
-    x = get_eval_sample(scaler, config, num_devices)
-    # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, inverse_scaler, sampling_shape, config, eval_folder)
-    # x = get_asset_sample(config)
-    x_flat, y, mask, num_obs = get_inpainting_observation(rng, x, config, mask_name='square')
-    plot_samples(
-      inverse_scaler(x_flat.copy()),
-      image_size=config.data.image_size,
-      num_channels=config.data.num_channels,
-      fname=eval_folder + "/_{}_{}_ground_{}".format(
-        config.sampling.noise_std, config.data.dataset, i))
-    plot_samples(
-      inverse_scaler(y.copy()),
-      image_size=config.data.image_size,
-      num_channels=config.data.num_channels,
-      fname=eval_folder + "/_{}_{}_observed_{}".format(
-        config.sampling.noise_std, config.data.dataset, i))
-    np.savez(eval_folder + "/{}_{}_ground_observed_{}.npz".format(
-      config.sampling.noise_std, config.data.dataset, i),
-      x=x, y=y, noise_std=config.sampling.noise_std)
+
+  num_eval = 1000
+  eval_ds = get_eval_dataset(scaler, config, num_devices)
+  eval_iter = iter(eval_ds)
+
+  # TODO: can tree_map be used to pmap across observation data?
+  for i, batch in enumerate(eval_iter):
+    if i == num_eval//config.eval.batch_size: break  # Only evaluate on first num_eval samples
+    eval_batch = jax.tree_map(lambda x: scaler(x._numpy()), batch)  # pylint: disable=protected-access
+    x = eval_batch['image'][0]
+    # x = get_eval_sample(scaler, config, num_devices)
+    _, y, mask, num_obs = get_inpainting_observation(rng, x, config, mask_name='half')
+
+    _plot_ground_observed(x.copy(), y.copy(), x.shape, eval_folder, inverse_scaler, config, i)
 
     if 'plus' not in config.sampling.cs_method:
       logging.warning(
@@ -1165,39 +1281,10 @@ def evaluate_inpainting(config,
       adjoint_observation_map = None
       H = None
 
-    for cs_method in cs_methods:
-      config.sampling.cs_method = cs_method
-      if cs_method in ddim_methods:
-        sampler = get_cs_sampler(config, sde, epsilon_fn, sampling_shape, inverse_scaler,
-          y, H, observation_map, adjoint_observation_map, stack_samples=False)
-      else:
-        sampler = get_cs_sampler(config, sde, score_fn, sampling_shape, inverse_scaler,
-          y, H, observation_map, adjoint_observation_map, stack_samples=False)
-
-      rng, sample_rng = random.split(rng, 2)
-      if config.eval.pmap:
-        sampler = jax.pmap(sampler, axis_name='batch')
-        rng, *sample_rng = random.split(rng, jax.local_device_count() + 1)
-        sample_rng = jnp.asarray(sample_rng)
-      else:
-        rng, sample_rng = random.split(rng, 2)
-
-      time_prev = time.time()
-      q_samples, _ = sampler(sample_rng)
-      sample_time = time.time() - time_prev
-      print("{}: {}s".format(cs_method, sample_time))
-      q_samples = q_samples.reshape((config.eval.batch_size,) + sampling_shape[1:])
-      eval_file = "{}_{}_{}_{}".format(
-        config.sampling.noise_std, config.data.dataset, config.sampling.cs_method.lower(), i)
-      eval_path = eval_folder + eval_file
-      np.savez(eval_path + ".npz", x=q_samples, y=y, noise_std=config.sampling.noise_std)
-      plot_samples(
-        q_samples,
-        image_size=config.data.image_size,
-        num_channels=config.data.num_channels,
-        fname=eval_path)
-      compute_metrics_inner(config, cs_method, eval_path, x, q_samples, data_pools, inception_model,
-                            compute_lpips=True, save=True)
+    _sample(i, config, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling_shape,
+          inverse_scaler, y, H, observation_map, adjoint_observation_map, rng,
+            compute_metrics=(x, data_pools, inception_model, inceptionv3))
+    logging.info("samples: {}/{}".format(i * config.eval.batch_size, num_eval))
 
   compute_metrics(config, cs_methods, eval_folder)
 
@@ -1213,55 +1300,70 @@ def evaluate_super_resolution(config,
     eval_folder: The subfolder for storing evaluation results. Default to
       "eval".
   """
-  # Tip: use CUDA_VISIBLE_DEVICES to restrict the devices visible to jax
-  # ... they must be all the same model of device for pmap to work
-  num_devices =  int(jax.local_device_count()) if config.eval.pmap else 1
+  (num_devices, cs_methods, sde, inverse_scaler, scaler, epsilon_fn, score_fn, sampling_shape, rng
+    ) = _setup(config, workdir, eval_folder)
 
-  # Create directory to eval_folder
-  eval_dir = os.path.join(workdir, eval_folder)
-  tf.io.gfile.makedirs(eval_dir)
+  # Use inceptionV3 for images with resolution higher than 256.
+  # inceptionv3 = config.data.image_size >= 256
+  inceptionv3 = False
+  inception_model = get_inception_model(inceptionv3=inceptionv3)
+  # Load pre-computed dataset statistics.
+  if config.data.dataset == 'FFHQ':
+    data_stats = None
+    data_pools = None
+  else:
+    data_stats = load_dataset_stats(config)
+    data_pools = data_stats["pool_3"]
 
-  rng = random.PRNGKey(config.seed + 1)
+  num_down_sample = 4
+  obs_shape=(
+    config.eval.batch_size, config.data.image_size//num_down_sample,
+    config.data.image_size//num_down_sample, config.data.num_channels)
+  method='bicubic'
+  # method='nearest'
 
-  # Create data normalizer and its inverse
-  scaler = datasets.get_data_scaler(config)
-  inverse_scaler = datasets.get_data_inverse_scaler(config)
+  num_eval = 1000
+  eval_ds = get_eval_dataset(scaler, config, num_devices)
+  eval_iter = iter(eval_ds)
+  # TODO: can tree_map be used to pmap across observation data?
+  for i, batch in enumerate(eval_iter):
+    if i == num_eval//config.eval.batch_size: break  # Only evaluate on first num_eval samples
+    eval_batch = jax.tree_map(lambda x: scaler(x._numpy()), batch)  # pylint: disable=protected-access
+    x = eval_batch['image'][0]
+    _, y, *_ = get_superresolution_observation(
+      rng, x, config,
+      shape=obs_shape,
+      method=method)
 
-  # Initialize model
-  rng, model_rng = random.split(rng)
-  score_model, init_model_state, initial_params = mutils.init_model(model_rng, config, num_devices)
-  optimizer = losses.get_optimizer(config).create(initial_params)
-  state = mutils.State(step=0, optimizer=optimizer, lr=config.optim.lr,
-                       model_state=init_model_state,
-                       ema_rate=config.model.ema_rate,
-                       params_ema=initial_params,
-                       rng=rng)  # pytype: disable=wrong-keyword-args
-  checkpoint_dir = workdir
-  cs_methods, sde = get_sde(config)
+    _plot_ground_observed(x.copy(), y.copy(), obs_shape, eval_folder, inverse_scaler, config, i)
 
-  # Create data normalizer and its inverse
-  scaler = datasets.get_data_scaler(config)
-  inverse_scaler = datasets.get_data_inverse_scaler(config)
+    def observation_map(x):
+      x = x.reshape(sampling_shape[1:])
+      y = jax.image.resize(x, obs_shape[1:], method)
+      return y.flatten()
 
-  # Get model state from checkpoint file
-  ckpt = config.eval.begin_ckpt
-  ckpt_filename = os.path.join(checkpoint_dir, "checkpoint_{}".format(ckpt))
-  if not tf.io.gfile.exists(ckpt_filename):
-    raise FileNotFoundError("{} does not exist".format(ckpt_filename))
-  state = checkpoints.restore_checkpoint(checkpoint_dir, state, step=ckpt)
-  epsilon_fn = mutils.get_epsilon_fn(
-    sde, score_model, state.params_ema, state.model_state, train=False, continuous=True)
-  score_fn = mutils.get_score_fn(
-    sde, score_model, state.params_ema, state.model_state, train=False, continuous=True)
-  batch_size = config.eval.batch_size
-  print("\nbatch_size={}".format(batch_size))
-  sampling_shape = (
-    config.eval.batch_size//num_devices,
-    config.data.image_size, config.data.image_size, config.data.num_channels)
-  print("sampling shape", sampling_shape)
+    def adjoint_observation_map(y):
+      y = y.reshape(obs_shape[1:])
+      x = jax.image.resize(y, sampling_shape[1:], method)
+      return x.flatten()
 
-  # Create different random states for different hosts in a multi-host environment (e.g., TPU pods)
-  rng = random.fold_in(rng, jax.host_id())
+    H = None
+
+    _sample(i, config, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling_shape,
+          inverse_scaler, y, H, observation_map, adjoint_observation_map, rng,
+            compute_metrics=(x, data_pools, inception_model, inceptionv3))
+    logging.info("samples: {}/{}".format(i * config.eval.batch_size, num_eval))
+
+  compute_metrics(config, cs_methods, eval_folder)
+
+
+def evaluate_from_file(config, workdir, eval_folder="eval"):
+  cs_methods, _ = get_sde(config)
+  compute_metrics(config, cs_methods, eval_folder)
+
+
+def revaluate_from_file(config, workdir, eval_folder="eval"):
+  cs_methods, _ = get_sde(config)
 
   # Use inceptionV3 for images with resolution higher than 256.
   inceptionv3 = config.data.image_size >= 256
@@ -1270,87 +1372,30 @@ def evaluate_super_resolution(config,
   data_stats = load_dataset_stats(config)
   data_pools = data_stats["pool_3"]
 
-  shape=(config.eval.batch_size, config.data.image_size//4, config.data.image_size//4, config.data.num_channels)
-  method='bicubic'  # 'bicubic'
-  num_sampling_rounds = 6
+  for cs_method in cs_methods:
+    config.sampling.cs_method = cs_method
+    eval_file = "{}_{}_{}".format(
+      config.sampling.noise_std, config.data.dataset, config.sampling.cs_method.lower())  # NEW
+    stats = tf.io.gfile.glob(os.path.join(eval_folder, eval_file + "_*_stats.npz"))
 
-  for i in range(num_sampling_rounds):
-    x = get_eval_sample(scaler, config, num_devices)
-    # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, inverse_scaler, sampling_shape, config, eval_folder)
-    # x = get_asset_sample(config)
-    x_flat, y, *_ = get_superresolution_observation(
-      rng, x, config,
-      shape=shape,
-      method=method)
-    plot_samples(
-      inverse_scaler(x_flat.copy()),
-      image_size=config.data.image_size,
-      num_channels=config.data.num_channels,
-      fname=eval_folder + "/_{}_{}_ground_{}".format(
-        config.sampling.noise_std, config.data.dataset, i))
-    plot_samples(
-      inverse_scaler(y.copy()),
-      image_size=shape[1],
-      num_channels=config.data.num_channels,
-      fname=eval_folder + "/_{}_{}_observed_{}".format(
-        config.sampling.noise_std, config.data.dataset, i))
-    np.savez(eval_folder + "/{}_{}_ground_observed_{}.npz".format(
-      config.sampling.noise_std, config.data.dataset, i),
-      x=x, y=y, noise_std=config.sampling.noise_std)
+    logging.info("stats path: {}, length stats: {}".format(
+      os.path.join(eval_folder, eval_file + "_*_stats.npz"), len(stats)))
 
-    def observation_map(x):
-      x = x.reshape(sampling_shape[1:])
-      y = jax.image.resize(x, shape[1:], method)
-      return y.flatten()
+    for stat_file in stats:
+      with tf.io.gfile.GFile(stat_file, "rb") as fin:
+        stat = np.load(fin)
+        x = stat["x"]
+        y = stat["y"]
+        q_samples = stat["samples"]
 
-    def adjoint_observation_map(y):
-      y = y.reshape(shape[1:])
-      x = jax.image.resize(y, sampling_shape[1:], method)
-      return x.flatten()
+        eval_file = "{}_{}_{}_{}".format(
+          config.sampling.noise_std, config.data.dataset, config.sampling.cs_method.lower(), -1)
+        eval_path = eval_folder + eval_file
+        compute_metrics_inner(config, cs_method, eval_path,
+                              # inverse_scaler(x), inverse_scaler(y), q_samples,
+                              x, y, q_samples,
+                              data_pools, inception_model, inceptionv3, compute_lpips=True, save=False)
 
-    H = None
-
-    for cs_method in cs_methods:
-      config.sampling.cs_method = cs_method
-      if cs_method in ddim_methods:
-        sampler = get_cs_sampler(config, sde, epsilon_fn, sampling_shape, inverse_scaler,
-          y, H, observation_map, adjoint_observation_map, stack_samples=False)
-      else:
-        sampler = get_cs_sampler(config, sde, score_fn, sampling_shape, inverse_scaler,
-          y, H, observation_map, adjoint_observation_map, stack_samples=False)
-
-      rng, sample_rng = random.split(rng, 2)
-      if config.eval.pmap:
-        sampler = jax.pmap(sampler, axis_name='batch')
-        rng, *sample_rng = random.split(rng, jax.local_device_count() + 1)
-        sample_rng = jnp.asarray(sample_rng)
-      else:
-        rng, sample_rng = random.split(rng, 2)
-
-      time_prev = time.time()
-      q_samples, _ = sampler(sample_rng)
-      sample_time = time.time() - time_prev
-      print("{}: {}s".format(cs_method, sample_time))
-      q_samples = q_samples.reshape((config.eval.batch_size,) + sampling_shape[1:])
-      eval_file = "{}_{}_{}_{}".format(
-        config.sampling.noise_std, config.data.dataset, config.sampling.cs_method.lower(), i)
-      eval_path = eval_folder + eval_file
-      np.savez(eval_path + ".npz", x=q_samples, y=y, noise_std=config.sampling.noise_std)
-      plot_samples(
-        q_samples,
-        image_size=config.data.image_size,
-        num_channels=config.data.num_channels,
-        fname=eval_path)
-      compute_metrics_inner(config, cs_method, eval_path, x, q_samples, data_pools, inception_model,
-                            compute_lpips=True, save=True)
-
-  compute_metrics(config, cs_methods, eval_folder)
-
-
-def evaluate_from_file(config,
-                   workdir,
-                   eval_folder="eval"):
-  cs_methods, _ = get_sde(config)
   compute_metrics(config, cs_methods, eval_folder)
 
 
@@ -1358,82 +1403,13 @@ def dps_search_inpainting(
     config,
     workdir,
     eval_folder="eval"):
-  # Tip: use CUDA_VISIBLE_DEVICES to restrict the devices visible to jax
-  # ... they must be all the same model of device for pmap to work
-  num_devices =  int(jax.local_device_count()) if config.eval.pmap else 1
 
-  # Create directory to eval_folder
-  eval_dir = os.path.join(workdir, eval_folder)
-  tf.io.gfile.makedirs(eval_dir)
+  (num_devices, cs_methods, sde, inverse_scaler, scaler, epsilon_fn, score_fn, sampling_shape, rng
+    ) = _setup(config, workdir, eval_folder)
 
-  rng = random.PRNGKey(config.seed + 1)
+  cs_methods = _dps_method(config)
 
-  # Create data normalizer and its inverse
-  scaler = datasets.get_data_scaler(config)
-  inverse_scaler = datasets.get_data_inverse_scaler(config)
-
-  # Initialize model
-  rng, model_rng = random.split(rng)
-  score_model, init_model_state, initial_params = mutils.init_model(model_rng, config, num_devices)
-  optimizer = losses.get_optimizer(config).create(initial_params)
-  state = mutils.State(step=0, optimizer=optimizer, lr=config.optim.lr,
-                       model_state=init_model_state,
-                       ema_rate=config.model.ema_rate,
-                       params_ema=initial_params,
-                       rng=rng)  # pytype: disable=wrong-keyword-args
-
-  checkpoint_dir = workdir
-
-  # Setup SDEs
-  if config.training.sde.lower() == 'vpsde':
-    sde = VP(beta_min=config.model.beta_min, beta_max=config.model.beta_max)
-    if 'plus' not in config.sampling.cs_method:
-      # VP/DDPM Methods with matrix H
-      # cs_method = 'chung2022scalar'
-      cs_method = 'DPSDDPM'
-    else:
-      # VP/DDM methods with mask
-      # cs_method = 'chung2022scalarplus'
-      cs_method = 'DPSDDPMplus'
-  elif config.training.sde.lower() == 'vesde':
-    sde = VE(sigma_min=config.model.sigma_min, sigma_max=config.model.sigma_max)
-    if 'plus' not in config.sampling.cs_method:
-      # VE/SMLD Methods with matrix H
-      # cs_method = 'chung2022scalar'
-      cs_method = 'DPSSMLD'
-    else:
-      # cs_method = 'chung2022scalarplus'
-      cs_method = 'DPSSMLDplus'
-  else:
-    raise NotImplementedError(f"SDE {config.training.sde} unknown.")
-
-  # Create data normalizer and its inverse
-  scaler = datasets.get_data_scaler(config)
-  inverse_scaler = datasets.get_data_inverse_scaler(config)
-
-  # Get model state from checkpoint file
-  ckpt = config.eval.begin_ckpt
-  ckpt_filename = os.path.join(checkpoint_dir, "checkpoint_{}".format(ckpt))
-  if not tf.io.gfile.exists(ckpt_filename):
-    raise FileNotFoundError("{} does not exist".format(ckpt_filename))
-  state = checkpoints.restore_checkpoint(checkpoint_dir, state, step=ckpt)
-
-  epsilon_fn = mutils.get_epsilon_fn(
-    sde, score_model, state.params_ema, state.model_state, train=False, continuous=True)
-  score_fn = mutils.get_score_fn(
-    sde, score_model, state.params_ema, state.model_state, train=False, continuous=True)
-
-  batch_size = config.eval.batch_size
-  print("\nbatch_size={}".format(batch_size))
-  sampling_shape = (
-    config.eval.batch_size//num_devices,
-    config.data.image_size, config.data.image_size, config.data.num_channels)
-  print("sampling shape", sampling_shape)
-
-  # Create different random states for different hosts in a multi-host environment (e.g., TPU pods)
-  rng = random.fold_in(rng, jax.host_id())
-
-  num_sampling_rounds = 10
+  num_sampling_rounds = 5
 
   # Use inceptionV3 for images with resolution higher than 256.
   inceptionv3 = config.data.image_size >= 256
@@ -1452,30 +1428,20 @@ def dps_search_inpainting(
   mse_means = []
   mse_stds = []
 
+  use_asset_sample = False
+  if use_asset_sample:
+    x = get_asset_sample(config)
+  elif not use_asset_sample:
+    x = get_eval_sample(scaler, config, num_devices)
+    # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, sampling_shape, config)
+  _, y, mask, num_obs = get_inpainting_observation(rng, x, config, mask_name='half')
+  _plot_ground_observed(x.copy(), y.copy(), x.shape, eval_folder, inverse_scaler, config, 0,
+                        search=True)
+
   for scale in dps_hyperparameters:
     # round to 3 sig fig
     scale = float(f'{float(f"{scale:.3g}"):g}')
     config.solver.dps_scale_hyperparameter = scale
-    x = get_eval_sample(scaler, config, num_devices)
-    # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, inverse_scaler, sampling_shape, config, eval_folder)
-    # x = get_asset_sample(config)
-
-    x_flat, y, mask, num_obs = get_inpainting_observation(rng, x, config, mask_name='square')
-    plot_samples(
-      inverse_scaler(x_flat.copy()),
-      image_size=config.data.image_size,
-      num_channels=config.data.num_channels,
-      fname=eval_folder + "/search_{}_{}_ground_{}".format(
-        config.sampling.noise_std, config.data.dataset, scale))
-    plot_samples(
-      inverse_scaler(y.copy()),
-      image_size=config.data.image_size,
-      num_channels=config.data.num_channels,
-      fname=eval_folder + "/search_{}_{}_observed_{}".format(
-        config.sampling.noise_std, config.data.dataset, scale))
-    np.savez(eval_folder + "/search_{}_{}_ground_observed_{}.npz".format(
-      config.sampling.noise_std, config.data.dataset, scale),
-      x=x, y=y, noise_std=config.sampling.noise_std)
 
     if 'plus' not in config.sampling.cs_method and mask:
       logging.warning(
@@ -1498,40 +1464,12 @@ def dps_search_inpainting(
       adjoint_observation_map = None
       H = None
 
-    config.sampling.cs_method = cs_method
-    if cs_method in ddim_methods:
-      sampler = get_cs_sampler(config, sde, epsilon_fn, sampling_shape, inverse_scaler,
-        y, H, observation_map, adjoint_observation_map, stack_samples=False)
-    else:
-      sampler = get_cs_sampler(config, sde, score_fn, sampling_shape, inverse_scaler,
-        y, H, observation_map, adjoint_observation_map, stack_samples=False)
+    (psnr_mean, psnr_std), (lpips_mean, lpips_std), (mse_mean, mse_std), (ssim_mean, ssim_std) = _sample(
+      scale, config, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling_shape,
+      inverse_scaler, y, H, observation_map, adjoint_observation_map, rng,
+      compute_metrics=(x, data_pools, inception_model, inceptionv3), search=True)[0]
+    logging.info("scale: {}".format(scale))
 
-    rng, sample_rng = random.split(rng, 2)
-    if config.eval.pmap:
-      sampler = jax.pmap(sampler, axis_name='batch')
-      rng, *sample_rng = random.split(rng, jax.local_device_count() + 1)
-      sample_rng = jnp.asarray(sample_rng)
-    else:
-      rng, sample_rng = random.split(rng, 2)
-
-    time_prev = time.time()
-    q_samples, _ = sampler(sample_rng)
-    sample_time = time.time() - time_prev
-    print("{}: {}s".format(cs_method, sample_time))
-    q_samples = q_samples.reshape((config.eval.batch_size,) + sampling_shape[1:])
-    plot_samples(
-      q_samples,
-      image_size=config.data.image_size,
-      num_channels=config.data.num_channels,
-      fname=eval_folder + "/search_{}_{}_{}_{}".format(config.sampling.noise_std, config.data.dataset, config.sampling.cs_method.lower(), scale))
-    # Save samples
-    eval_file = "search_{}_{}_{}_{}".format(
-      config.sampling.noise_std, config.data.dataset, config.sampling.cs_method.lower(), scale)
-    eval_path = eval_folder + eval_file
-    np.savez(eval_path + ".npz", x=q_samples, y=y, noise_std=config.sampling.noise_std)
-    (psnr_mean, psnr_std), (lpips_mean, lpips_std), (mse_mean, mse_std), (ssim_mean, ssim_std) = compute_metrics_inner(
-      config, cs_method, eval_path, x, q_samples, data_pools, inception_model,
-      compute_lpips=True, save=False)
     psnr_means.append(psnr_mean)
     psnr_stds.append(psnr_std)
     lpips_means.append(lpips_mean)
@@ -1560,82 +1498,12 @@ def dps_search_inpainting(
 def dps_search_super_resolution(config,
              workdir,
              eval_folder="eval"):
-  # Tip: use CUDA_VISIBLE_DEVICES to restrict the devices visible to jax
-  # ... they must be all the same model of device for pmap to work
-  num_devices =  int(jax.local_device_count()) if config.eval.pmap else 1
+  (num_devices, cs_methods, sde, inverse_scaler, scaler, epsilon_fn, score_fn, sampling_shape, rng
+    ) = _setup(config, workdir, eval_folder)
 
-  # Create directory to eval_folder
-  eval_dir = os.path.join(workdir, eval_folder)
-  tf.io.gfile.makedirs(eval_dir)
+  cs_methods = _dps_method(config)
 
-  rng = random.PRNGKey(config.seed + 1)
-
-  # Create data normalizer and its inverse
-  scaler = datasets.get_data_scaler(config)
-  inverse_scaler = datasets.get_data_inverse_scaler(config)
-
-  # Initialize model
-  rng, model_rng = random.split(rng)
-  score_model, init_model_state, initial_params = mutils.init_model(model_rng, config, num_devices)
-  optimizer = losses.get_optimizer(config).create(initial_params)
-  state = mutils.State(step=0, optimizer=optimizer, lr=config.optim.lr,
-                       model_state=init_model_state,
-                       ema_rate=config.model.ema_rate,
-                       params_ema=initial_params,
-                       rng=rng)  # pytype: disable=wrong-keyword-args
-
-  checkpoint_dir = workdir
-
-  # Setup SDEs
-  if config.training.sde.lower() == 'vpsde':
-    sde = VP(beta_min=config.model.beta_min, beta_max=config.model.beta_max)
-    if 'plus' not in config.sampling.cs_method:
-      # VP/DDPM Methods with matrix H
-      # cs_method = 'chung2022scalar'
-      cs_method = 'DPSDDPM'
-    else:
-      # VP/DDM methods with mask
-      # cs_method = 'chung2022scalarplus'
-      cs_method = 'DPSDDPMplus'
-  elif config.training.sde.lower() == 'vesde':
-    sde = VE(sigma_min=config.model.sigma_min, sigma_max=config.model.sigma_max)
-    if 'plus' not in config.sampling.cs_method:
-      # VE/SMLD Methods with matrix H
-      # cs_method = 'chung2022scalar'
-      cs_method = 'DPSSMLD'
-    else:
-      # cs_method = 'chung2022scalarplus'
-      cs_method = 'DPSSMLDplus'
-  else:
-    raise NotImplementedError(f"SDE {config.training.sde} unknown.")
-
-  # Create data normalizer and its inverse
-  scaler = datasets.get_data_scaler(config)
-  inverse_scaler = datasets.get_data_inverse_scaler(config)
-
-  # Get model state from checkpoint file
-  ckpt = config.eval.begin_ckpt
-  ckpt_filename = os.path.join(checkpoint_dir, "checkpoint_{}".format(ckpt))
-  if not tf.io.gfile.exists(ckpt_filename):
-    raise FileNotFoundError("{} does not exist".format(ckpt_filename))
-  state = checkpoints.restore_checkpoint(checkpoint_dir, state, step=ckpt)
-
-  epsilon_fn = mutils.get_epsilon_fn(
-    sde, score_model, state.params_ema, state.model_state, train=False, continuous=True)
-  score_fn = mutils.get_score_fn(
-    sde, score_model, state.params_ema, state.model_state, train=False, continuous=True)
-
-  batch_size = config.eval.batch_size
-  print("\nbatch_size={}".format(batch_size))
-  sampling_shape = (
-    config.eval.batch_size//num_devices,
-    config.data.image_size, config.data.image_size, config.data.num_channels)
-  print("sampling shape", sampling_shape)
-
-  # Create different random states for different hosts in a multi-host environment (e.g., TPU pods)
-  rng = random.fold_in(rng, jax.host_id())
-
-  num_sampling_rounds = 10
+  num_sampling_rounds = 5
 
   # Use inceptionV3 for images with resolution higher than 256.
   inceptionv3 = config.data.image_size >= 256
@@ -1645,6 +1513,10 @@ def dps_search_super_resolution(config,
   data_pools = data_stats["pool_3"]
 
   dps_hyperparameters = jnp.logspace(-1.5, 0.4, num=num_sampling_rounds, base=10.0)
+  # dps_hyperparameters = jnp.logspace(-0.5, 1.4, num=num_sampling_rounds, base=10.0)
+  # dps_hyperparameters = jnp.flip(dps_hyperparameters)
+  logging.info("dps_hyperparameters: {}".format(dps_hyperparameters))
+
   psnr_means = []
   psnr_stds = []
   lpips_means = []
@@ -1654,82 +1526,49 @@ def dps_search_super_resolution(config,
   mse_means = []
   mse_stds = []
 
-  shape = (config.eval.batch_size, config.data.image_size//4, config.data.image_size//4, config.data.num_channels)
-  method = 'bicubic'
+  num_downscale = 2
+  obs_shape = (config.eval.batch_size, config.data.image_size//num_downscale,
+               config.data.image_size//num_downscale, config.data.num_channels)
+  # method = 'bicubic'
+  method = 'nearest'
+
+  use_asset_sample = False
+  if use_asset_sample:
+    x = get_asset_sample(config)
+  elif not use_asset_sample:
+    x = get_eval_sample(scaler, config, num_devices)
+    # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, sampling_shape, config)
+  _, y, *_ = get_superresolution_observation(
+    rng, x, config,
+    shape=obs_shape,
+    method=method)
+
+  _plot_ground_observed(x.copy(), y.copy(), obs_shape, eval_folder,
+                        inverse_scaler, config, 0, search=True)
+
   for scale in dps_hyperparameters:
     # round to 3 sig fig
     scale = float(f'{float(f"{scale:.3g}"):g}')
     config.solver.dps_scale_hyperparameter = scale
-    x = get_eval_sample(scaler, config, num_devices)
-    # x = get_prior_sample(rng, score_fn, epsilon_fn, sde, inverse_scaler, sampling_shape, config, eval_folder)
-    # x = get_asset_sample(config)
-
-    x_flat, y, mask, num_obs = get_superresolution_observation(
-      rng, x, config,
-      shape=shape,
-      method=method)
-    plot_samples(
-      inverse_scaler(x_flat.copy()),
-      image_size=config.data.image_size,
-      num_channels=config.data.num_channels,
-      fname=eval_folder + "/search_{}_{}_ground_{}".format(
-        config.sampling.noise_std, config.data.dataset, scale))
-    plot_samples(
-      inverse_scaler(y.copy()),
-      image_size=shape[1],
-      num_channels=config.data.num_channels,
-      fname=eval_folder + "/search_{}_{}_observed_{}".format(
-        config.sampling.noise_std, config.data.dataset, scale))
-    np.savez(eval_folder + "/search_{}_{}_ground_observed_{}.npz".format(
-      config.sampling.noise_std, config.data.dataset, scale),
-      x=x, y=y, noise_std=config.sampling.noise_std)
 
     def observation_map(x):
       x = x.reshape(sampling_shape[1:])
-      y = jax.image.resize(x, shape[1:], method)
+      y = jax.image.resize(x, obs_shape[1:], method)
       return y.flatten()
 
     def adjoint_observation_map(y):
-      y = y.reshape(shape[1:])
+      y = y.reshape(obs_shape[1:])
       x = jax.image.resize(y, sampling_shape[1:], method)
       return x.flatten()
 
     H = None
 
-    config.sampling.cs_method = cs_method
-    if cs_method in ddim_methods:
-      sampler = get_cs_sampler(config, sde, epsilon_fn, sampling_shape, inverse_scaler,
-        y, H, observation_map, adjoint_observation_map, stack_samples=False)
-    else:
-      sampler = get_cs_sampler(config, sde, score_fn, sampling_shape, inverse_scaler,
-        y, H, observation_map, adjoint_observation_map, stack_samples=False)
+    (psnr_mean, psnr_std), (lpips_mean, lpips_std), (mse_mean, mse_std), (ssim_mean, ssim_std) = _sample(
+      scale, config, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling_shape,
+      inverse_scaler, y, H, observation_map, adjoint_observation_map, rng,
+      compute_metrics=(x, data_pools, inception_model, inceptionv3), search=True)[0]
+    logging.info("scale: {}".format(scale))
 
-    rng, sample_rng = random.split(rng, 2)
-    if config.eval.pmap:
-      sampler = jax.pmap(sampler, axis_name='batch')
-      rng, *sample_rng = random.split(rng, jax.local_device_count() + 1)
-      sample_rng = jnp.asarray(sample_rng)
-    else:
-      rng, sample_rng = random.split(rng, 2)
-
-    time_prev = time.time()
-    q_samples, _ = sampler(sample_rng)
-    sample_time = time.time() - time_prev
-    print("{}: {}s".format(cs_method, sample_time))
-    q_samples = q_samples.reshape((config.eval.batch_size,) + sampling_shape[1:])
-    plot_samples(
-      q_samples,
-      image_size=config.data.image_size,
-      num_channels=config.data.num_channels,
-      fname=eval_folder + "/search_{}_{}_{}_{}".format(config.sampling.noise_std, config.data.dataset, config.sampling.cs_method.lower(), scale))
-    # Save samples
-    eval_file = "search_{}_{}_{}_{}".format(
-      config.sampling.noise_std, config.data.dataset, config.sampling.cs_method.lower(), scale)
-    eval_path = eval_folder + eval_file
-    np.savez(eval_path + ".npz", x=q_samples, y=y, noise_std=config.sampling.noise_std)
-    (psnr_mean, psnr_std), (lpips_mean, lpips_std), (mse_mean, mse_std), (ssim_mean, ssim_std) = compute_metrics_inner(
-      config, cs_method, eval_path, x, q_samples, data_pools, inception_model,
-      compute_lpips=True, save=False)
     psnr_means.append(psnr_mean)
     psnr_stds.append(psnr_std)
     lpips_means.append(lpips_mean)

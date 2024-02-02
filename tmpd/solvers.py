@@ -10,7 +10,7 @@ def batch_dot(a, b):
 
 
 class STSL(DDIMVP):
-  def __init__(self, scale, likelihood_strength, y, observation_map, adjoint_observation_map, noise_std, shape, model, eta=0.0, beta=None, ts=None):
+  def __init__(self, scale, likelihood_strength, y, observation_map, adjoint_observation_map, noise_std, shape, model, eta=1.0, beta=None, ts=None):
     super().__init__(model, eta, beta, ts)
     self.estimate_h_x_0_vmap = self.get_estimate_x_0_vmap(observation_map)
     self.y = y
@@ -19,17 +19,13 @@ class STSL(DDIMVP):
     self.num_y = y.shape[1]
     self.num_x = sum([d for d in shape])
     self.observation_map = observation_map
-    self.likelihood_score_vmap = self.get_likelihood_score_vmap(self.get_estimate_x_0_vmap(observation_map))
+    self.likelihood_score_vmap = self.get_likelihood_score_vmap()
     self.adjoint_observation_map = adjoint_observation_map
     self.batch_adjoint_observation_map = vmap(adjoint_observation_map)
-    self.batch_observation_map = vmap(observation_map)
-    self.jacrev_vmap = vmap(jacrev(lambda x, t, timestep: self.estimate_h_x_0_vmap(x, t, timestep)[0]))
-    # self.axes = (0,) + tuple(range(len(shape) + 4)[2:]) + (1,)
-    self.axes_vmap = tuple(range(len(shape) + 3)[1:]) + (0,)
     self.likelihood_strength = likelihood_strength
     self.scale = scale
 
-  def get_likelihood_score_vmap(self, estimate_h_x_0_vmap):
+  def get_likelihood_score_vmap(self):
     def l2_norm(x, t, timestep, y, rng):
       m = self.sqrt_alphas_cumprod[timestep]
       sqrt_1m_alpha = self.sqrt_1m_alphas_cumprod[timestep]
@@ -53,8 +49,6 @@ class STSL(DDIMVP):
     beta = self.discrete_betas[timestep]
     sqrt_1m_alpha = self.sqrt_1m_alphas_cumprod[timestep]
     v = sqrt_1m_alpha**2
-    alpha_cumprod = self.alphas_cumprod[timestep]
-    alpha_cumprod_prev = self.alphas_cumprod_prev[timestep]
     alpha = self.alphas[timestep]
     m_prev = self.sqrt_alphas_cumprod_prev[timestep]
     v_prev = self.sqrt_1m_alphas_cumprod_prev[timestep]**2
@@ -73,7 +67,7 @@ class MPGD(DDIMVP):
   TODO: This method requires a pretrained autoencoder.
   MPGD He, Murata et al. https://arxiv.org/pdf/2311.16424.pdf"""
   
-  def __init__(self, scale, y, observation_map, noise_std, shape, model, eta=0.0, beta=None, ts=None):
+  def __init__(self, scale, y, observation_map, noise_std, shape, model, eta=1.0, beta=None, ts=None):
     super().__init__(model, eta, beta, ts)
     self.observation_map = observation_map
     self.batch_observation_map = vmap(observation_map)
@@ -83,8 +77,6 @@ class MPGD(DDIMVP):
     self.y = y
     self.noise_std = noise_std
     self.num_y = y.shape[1]
-    # self.axes = (0,) + tuple(range(len(shape) + 2)[2:]) + (1,)
-    self.axes_vmap = tuple(range(len(shape) + 1)[1:]) + (0,)
 
   def get_likelihood_score_vmap(self, observation_map):
     def l2_norm(x_0, y):
@@ -127,9 +119,8 @@ class MPGD(DDIMVP):
 
 class KGDMVP(DDIMVP):
   """Kalman Guided Diffusion Model, Markov chain using the DDIM Markov Chain or VP SDE."""
-  def __init__(self, y, observation_map, noise_std, shape, model, eta=0.0, beta=None, ts=None):
+  def __init__(self, y, observation_map, noise_std, shape, model, eta=1.0, beta=None, ts=None):
     super().__init__(model, eta, beta, ts)
-    self.estimate_h_x_0 = self.get_estimate_x_0(observation_map)
     self.estimate_h_x_0_vmap = self.get_estimate_x_0_vmap(observation_map)
     self.batch_analysis_vmap = vmap(self.analysis)
     self.y = y
@@ -137,8 +128,6 @@ class KGDMVP(DDIMVP):
     self.num_y = y.shape[1]
     self.observation_map = observation_map
     self.batch_observation_map = vmap(observation_map)
-    self.jacrev_vmap = vmap(jacrev(lambda x, t, timestep: self.estimate_h_x_0_vmap(x, t, timestep)[0]))
-    # self.axes = (0,) + tuple(range(len(shape) + 2)[2:]) + (1,)
     self.axes_vmap = tuple(range(len(shape) + 1)[1:]) + (0,)
 
   def analysis(self, y, x, t, timestep, ratio):
@@ -180,12 +169,10 @@ class KGDMVPplus(KGDMVP):
 
 
 class KGDMVE(DDIMVE):
-  def __init__(self, y, observation_map, noise_std, shape, model, eta=0.0, sigma=None, ts=None):
+  def __init__(self, y, observation_map, noise_std, shape, model, eta=1.0, sigma=None, ts=None):
     super().__init__(model, eta, sigma, ts)
     self.eta = eta
     self.model = model
-    self.sigma_min = sigma_min
-    self.sigma_max = sigma_max
     self.discrete_sigmas = jnp.exp(
         jnp.linspace(jnp.log(self.sigma_min),
                       jnp.log(self.sigma_max),
@@ -193,13 +180,10 @@ class KGDMVE(DDIMVE):
     self.y = y
     self.noise_std = noise_std
     self.num_y = y.shape[1]
-    self.estimate_h_x_0 = self.get_estimate_x_0(observation_map)
     self.estimate_h_x_0_vmap = self.get_estimate_x_0_vmap(observation_map)
     self.batch_analysis_vmap = vmap(self.analysis)
     self.observation_map = observation_map
     self.batch_observation_map  = vmap(observation_map)
-    self.jacrev_vmap = vmap(jacrev(lambda x, t, timestep: self.estimate_h_x_0_vmap(x, t, timestep)[0]))
-    # self.axes = (0,) + tuple(range(len(shape) + 2)[2:]) + (1,)
     self.axes_vmap = tuple(range(len(shape) + 1)[1:]) + (0,)
 
   def analysis(self, y, x, t, timestep, ratio):
@@ -236,20 +220,16 @@ class KGDMVEplus(KGDMVE):
 
 class PiGDMVP(DDIMVP):
   """PiGDM Song et al. 2023. Markov chain using the DDIM Markov Chain or VP SDE."""
-  def __init__(self, y, observation_map, noise_std, shape, model, data_variance=1.0, eta=0.0, beta=None, ts=None):
+  def __init__(self, y, observation_map, noise_std, shape, model, data_variance=1., eta=1., beta=None, ts=None):
     super().__init__(model, eta, beta, ts)
-    self.estimate_h_x_0 = self.get_estimate_x_0(observation_map)
-    self.estimate_h_x_0_vmap = self.get_estimate_x_0_vmap(observation_map)
+    # This method requires clipping in order to remain (robustly, over all samples) numerically stable
+    self.estimate_h_x_0_vmap = self.get_estimate_x_0_vmap(observation_map, clip=True, centered=True)
     self.batch_analysis_vmap = vmap(self.analysis)
     self.y = y
     self.noise_std = noise_std
     self.data_variance = data_variance
     self.num_y = y.shape[1]
     self.observation_map = observation_map
-    self.batch_observation_map = vmap(observation_map)
-    self.jacrev_vmap = vmap(jacrev(lambda x, t, timestep: self.estimate_h_x_0_vmap(x, t, timestep)[0]))
-    # self.axes = (0,) + tuple(range(len(shape) + 4)[2:]) + (1,)
-    self.axes_vmap = tuple(range(len(shape) + 3)[1:]) + (0,)
 
   def analysis(self, y, x, t, timestep, v, alpha):
     h_x_0, vjp_h_x_0, (epsilon, _) = vjp(
@@ -265,13 +245,14 @@ class PiGDMVP(DDIMVP):
     m = self.sqrt_alphas_cumprod[timestep]
     sqrt_1m_alpha = self.sqrt_1m_alphas_cumprod[timestep]
     v = sqrt_1m_alpha**2
-    alpha = m**2
+    alpha = self.alphas_cumprod[timestep]
     epsilon, ls = self.batch_analysis_vmap(self.y, x, t, timestep, v, alpha)
     m_prev = self.sqrt_alphas_cumprod_prev[timestep]
     v_prev = self.sqrt_1m_alphas_cumprod_prev[timestep]**2
-    alpha_prev = m_prev**2
+    alpha_prev = self.alphas_cumprod_prev[timestep]
     coeff1 = self.eta * jnp.sqrt((v_prev / v) * (1 - alpha / alpha_prev))
     coeff2 = jnp.sqrt(v_prev - coeff1**2)
+    # TODO: slightly different to Algorithm 1
     posterior_score = - batch_mul(1. / sqrt_1m_alpha, epsilon) + ls
     x_mean = batch_mul(m_prev / m, x) + batch_mul(sqrt_1m_alpha * (sqrt_1m_alpha * m_prev / m - coeff2), posterior_score)
     std = coeff1
@@ -285,18 +266,22 @@ class PiGDMVPplus(PiGDMVP):
       lambda x: self.estimate_h_x_0_vmap(x, t, timestep), x, has_aux=True)
     # Value suggested for VPSDE in original PiGDM paper
     r = v * self.data_variance  / (v + alpha * self.data_variance)
-    C_yy = r + self.noise_std**2
+    C_yy = 1. + self.noise_std**2 / r
     ls = vjp_estimate_h_x_0((y - h_x_0) / C_yy)[0]
     return epsilon.squeeze(axis=0), ls
 
 
-class SSPiGDMVP(DDIMVP):
+class ReproducePiGDMVP(DDIMVP):
   """
-  Note: We found this method to be unstable on all datasets.
+  NOTE: We found this method to be unstable on CIFAR10 dataset, even with
+    thresholding (clip=True) is used at each step of estimating x_0, and for each weighting
+    schedule that we tried.
   PiGDM Song et al. 2023. Markov chain using the DDIM Markov Chain or VP SDE."""
-  def __init__(self, y, observation_map, noise_std, shape, model, eta=0.0, num_steps=1000, dt=None, epsilon=None, beta_min=0.1, beta_max=20.):
-    super().__init__(model, eta, num_steps, dt, epsilon, beta_min, beta_max)
-    self.estimate_h_x_0 = self.get_estimate_x_0_vmap(observation_map)
+
+  def __init__(self, y, observation_map, noise_std, shape, model, data_variance=1., eta=1., beta=None, ts=None):
+    super().__init__(model, eta, beta, ts)
+    self.data_variance = data_variance
+    self.estimate_h_x_0_vmap = self.get_estimate_x_0_vmap(observation_map, clip=True, centered=True)
     self.batch_analysis_vmap = vmap(self.analysis)
     self.y = y
     self.noise_std = noise_std
@@ -304,11 +289,13 @@ class SSPiGDMVP(DDIMVP):
 
   def analysis(self, y, x, t, timestep, v, alpha):
     h_x_0, vjp_estimate_h_x_0, (epsilon, x_0) = vjp(
-      lambda x: self.estimate_h_x_0(x, t, timestep), x, has_aux=True)
-    # Value suggested for VPSDE in original PiGDM paper
-    r = v * self.data_variance  / (v + alpha * self.data_variance)
-    C_yy = r + self.noise_std**2
-    ls = r * vjp_estimate_h_x_0((y - h_x_0) / C_yy)[0]
+      lambda x: self.estimate_h_x_0_vmap(x, t, timestep), x, has_aux=True)
+    # Value suggested for VPSDE in original PiGDM paper:
+    r = v * self.data_variance  / (v + self.data_variance)
+    # What it should really be set to, following the authors' mathematical reasoning:
+    # r = v * self.data_variance  / (v + alpha * self.data_variance)
+    C_yy = 1. + self.noise_std**2 / r
+    ls = vjp_estimate_h_x_0((y - h_x_0) / C_yy)[0]
     return x_0.squeeze(axis=0), ls, epsilon.squeeze(axis=0)
 
   def posterior(self, x, t):
@@ -316,11 +303,11 @@ class SSPiGDMVP(DDIMVP):
     m = self.sqrt_alphas_cumprod[timestep]
     sqrt_1m_alpha = self.sqrt_1m_alphas_cumprod[timestep]
     v = sqrt_1m_alpha**2
-    alpha = m**2
-    x_0, ls, epsilon = self.batch_analysis_vmap(x, t, timestep, v, alpha)
+    alpha = self.alphas_cumprod[timestep]
+    x_0, ls, epsilon = self.batch_analysis_vmap(self.y, x, t, timestep, v, alpha)
     m_prev = self.sqrt_alphas_cumprod_prev[timestep]
     v_prev = self.sqrt_1m_alphas_cumprod_prev[timestep]**2
-    alpha_prev = m_prev**2
+    alpha_prev = self.alphas_cumprod_prev[timestep]
     coeff1 = self.eta * jnp.sqrt((v_prev / v) * (1 - alpha / alpha_prev))
     coeff2 = jnp.sqrt(v_prev - coeff1**2)
     x_mean = batch_mul(m_prev, x_0) + batch_mul(coeff2, epsilon) + batch_mul(m, ls)
@@ -328,29 +315,35 @@ class SSPiGDMVP(DDIMVP):
     return x_mean, std
 
 
+class ReproducePiGDMVPplus(ReproducePiGDMVP):
+  """
+  NOTE: We found this method to be unstable on CIFAR10 dataset, even with
+    thresholding (clip=True) is used at each step of estimating x_0, and for each weighting
+    schedule that we tried.
+  PiGDM with a mask. Song et al. 2023. Markov chain using the DDIM Markov Chain or VP SDE."""
+  def analysis(self, y, x, t, timestep, v, alpha):
+    h_x_0, vjp_estimate_h_x_0, (epsilon, x_0) = vjp(
+      lambda x: self.estimate_h_x_0_vmap(x, t, timestep), x, has_aux=True)
+    # Value suggested for VPSDE in original PiGDM paper:
+    r = v * self.data_variance  / (v + self.data_variance)
+    # What it should really be set to, following the authors' mathematical reasoning:
+    # r = v * self.data_variance  / (v + alpha * self.data_variance)
+    C_yy = 1. + self.noise_std**2 / r
+    ls = vjp_estimate_h_x_0((y - h_x_0) / C_yy)[0]
+    return x_0.squeeze(axis=0), ls, epsilon.squeeze(axis=0)
+
+
 class PiGDMVE(DDIMVE):
   """PiGDMVE for the SMLD Markov Chain or VE SDE."""
-  def __init__(self, y, observation_map, noise_std, shape, model, data_variance=1.0, eta=0.0, sigma=None, ts=None):
+  def __init__(self, y, observation_map, noise_std, shape, model, data_variance=1., eta=1., sigma=None, ts=None):
     super().__init__(model, eta, sigma, ts)
-    self.eta = eta
-    self.model = model
-    self.sigma_min = sigma_min
-    self.sigma_max = sigma_max
-    self.discrete_sigmas = jnp.exp(
-        jnp.linspace(jnp.log(self.sigma_min),
-                    jnp.log(self.sigma_max),
-                    self.num_steps))
     self.y = y
     self.data_variance = data_variance
     self.noise_std = noise_std
     self.num_y = y.shape[1]
-    self.estimate_h_x_0 = self.get_estimate_x_0(observation_map)
-    self.estimate_h_x_0_vmap = self.get_estimate_x_0_vmap(observation_map)
+    # This method requires clipping in order to remain (robustly, over all samples) numerically stable
+    self.estimate_h_x_0_vmap = self.get_estimate_x_0_vmap(observation_map, clip=True, centered=False)
     self.batch_analysis_vmap = vmap(self.analysis)
-    self.batch_observation_map = vmap(observation_map)
-    self.jacrev_vmap = vmap(jacrev(lambda x, t, timestep: self.estimate_h_x_0_vmap(x, t, timestep)[0]))
-    # self.axes = (0,) + tuple(range(len(shape) + 2)[2:]) + (1,)
-    self.axes_vmap = tuple(range(len(shape) + 1)[1:]) + (0,)
 
   def analysis(self, y, x, t, timestep, v):
     h_x_0, vjp_h_x_0, (epsilon, x_0) = vjp(
@@ -385,13 +378,17 @@ class PiGDMVEplus(PiGDMVE):
 
 
 class DPSSMLD(SMLD):
-  """DPS for SMLD ancestral sampling."""
+  """DPS for SMLD ancestral sampling.
+    NOTE: This method requires static thresholding (clip=True) in order to remain
+      (robustly, over all samples) numerically stable"""
   def __init__(self, scale, y, observation_map, score, sigma=None, ts=None):
     super().__init__(score, sigma, ts)
     self.y = y
     self.scale = scale
-    self.likelihood_score = self.get_likelihood_score(self.get_estimate_x_0(observation_map))
-    self.likelihood_score_vmap = self.get_likelihood_score_vmap(self.get_estimate_x_0_vmap(observation_map))
+    self.likelihood_score = self.get_likelihood_score(
+      self.get_estimate_x_0(observation_map, clip=True, centered=False))
+    self.likelihood_score_vmap = self.get_likelihood_score_vmap(
+      self.get_estimate_x_0_vmap(observation_map, clip=True, centered=False))
 
   def get_likelihood_score_vmap(self, estimate_h_x_0_vmap):
     def l2_norm(x, t, timestep, y):
@@ -417,7 +414,14 @@ class DPSSMLD(SMLD):
     # ls, score = self.likelihood_score(x, t, timestep, self.y)
     ls, score = self.likelihood_score_vmap(x, t, timestep, self.y)
     x_mean, std = self.posterior(score, x, timestep)
-    x_mean -= self.scale * ls  # DPS
+
+    # play around with dps method for the best weighting schedule...
+    # sigma = self.discrete_sigmas[timestep]
+    # sigma_prev = self.discrete_sigmas_prev[timestep]
+    # x_mean = x_mean - batch_mul(1 - sigma_prev**2 / sigma**2, self.scale * ls)
+    # x_mean = x_mean - batch_mul(sigma**2, self.scale * ls)
+    # Since DPS was empirically derived for VP SDE, the scaling in their paper will not work for VE SDE
+    x_mean = x_mean - self.scale * ls  # Not the correct scaling for VE
     z = random.normal(rng, x.shape)
     x = x_mean + batch_mul(std, z)
     return x, x_mean
@@ -427,13 +431,17 @@ DPSSMLDplus = DPSSMLD
 
 
 class DPSDDPM(DDPM):
-  """DPS for DDPM ancestral sampling."""
+  """DPS for DDPM ancestral sampling.
+    NOTE: This method requires static thresholding (clip=True) in order to remain
+      (robustly, over all samples) numerically stable"""
   def __init__(self, scale, y, observation_map, score, beta=None, ts=None):
     super().__init__(score, beta, ts)
     self.y = y
     self.scale = scale
-    self.likelihood_score = self.get_likelihood_score(self.get_estimate_x_0(observation_map))
-    self.likelihood_score_vmap = self.get_likelihood_score_vmap(self.get_estimate_x_0_vmap(observation_map))
+    self.likelihood_score = self.get_likelihood_score(
+      self.get_estimate_x_0(observation_map, clip=True, centered=True))
+    self.likelihood_score_vmap = self.get_likelihood_score_vmap(
+      self.get_estimate_x_0_vmap(observation_map, clip=True, centered=True))
 
   def get_likelihood_score_vmap(self, estimate_h_x_0_vmap):
     def l2_norm(x, t, timestep, y):
@@ -477,14 +485,10 @@ class KPDDPM(DDPM):
     # NOTE: Special case when num_y==1 can be handled correctly by defining observation_map output shape (1,)
     self.num_y = y.shape[1]
     self.shape = shape
-    self.estimate_h_x_0 = self.get_estimate_x_0(observation_map)
     self.estimate_h_x_0_vmap = self.get_estimate_x_0_vmap(observation_map)
     self.batch_analysis_vmap = vmap(self.analysis)
     self.observation_map = observation_map
     self.batch_observation_map = vmap(observation_map)
-    self.batch_observation_map = vmap(observation_map)
-    self.jacrev_vmap = vmap(jacrev(lambda x, t, timestep: self.estimate_h_x_0_vmap(x, t, timestep)[0]))
-    # self.axes = (0,) + tuple(range(len(shape) + 2)[2:]) + (1,)
     self.axes_vmap = tuple(range(len(shape) + 1)[1:]) + (0,)
 
   def analysis(self, y, x, t, timestep, ratio):
@@ -502,11 +506,11 @@ class KPDDPM(DDPM):
     m = self.sqrt_alphas_cumprod[timestep]
     v = self.sqrt_1m_alphas_cumprod[timestep]**2
     ratio = v / m
-    x_dash = self.batch_analysis_vmap(self.y, x, t, timestep, ratio)
+    x_0 = self.batch_analysis_vmap(self.y, x, t, timestep, ratio)
     alpha = self.alphas[timestep]
     m_prev = self.sqrt_alphas_cumprod_prev[timestep]
     v_prev = self.sqrt_1m_alphas_cumprod_prev[timestep]**2
-    x_mean = batch_mul(jnp.sqrt(alpha) * v_prev / v, x) + batch_mul(m_prev * beta / v, x_dash)
+    x_mean = batch_mul(jnp.sqrt(alpha) * v_prev / v, x) + batch_mul(m_prev * beta / v, x_0)
     std = jnp.sqrt(beta * v_prev / v)
     return x_mean, std
 
@@ -535,14 +539,10 @@ class KPSMLD(SMLD):
     self.y = y
     self.noise_std = noise_std
     self.num_y = y.shape[1]
-    self.estimate_h_x_0 = self.get_estimate_x_0(observation_map)
-    self.estimate_h_x_0_vmap = self.get_estimate_x_0_vmap(observation_map)
+    self.estimate_h_x_0_vmap = self.get_estimate_x_0_vmap(observation_map, clip=True, centered=False)
     self.batch_analysis_vmap = vmap(self.analysis)
     self.observation_map = observation_map
     self.batch_observation_map = vmap(observation_map)
-    self.jacrev_vmap = vmap(jacrev(lambda x, t, timestep: self.estimate_h_x_0_vmap(x, t, timestep)[0]))
-    # axes tuple for correct permutation of grad_H_x_0 array
-    self.axes = (0,) + tuple(range(len(shape) + 2)[2:]) + (1,)
     self.axes_vmap = tuple(range(len(shape) + 1)[1:]) + (0,)
 
   def analysis(self, y, x, t, timestep, ratio):

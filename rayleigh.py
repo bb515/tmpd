@@ -2,35 +2,26 @@
 from absl import app, flags
 from ml_collections.config_flags import config_flags
 import jax
-from jax import vmap, grad, jit
+from jax import vmap, jit
 import jax.random as random
 import jax.numpy as jnp
-from jax.tree_util import Partial as partial
-import numpyro.distributions as dist
-import pandas as pd
-from tqdm import trange
 import torch
-from torch import eye, randn_like, vstack, manual_seed
-from torch.distributions import MixtureSameFamily, MultivariateNormal, Categorical
 from diffusionjax.plot import plot_heatmap
 from diffusionjax.utils import get_sampler, get_times
-from diffusionjax.run_lib import get_ddim_chain
 from diffusionjax.solvers import EulerMaruyama
 import diffusionjax.sde as sde_lib
-from tmpd.samplers import get_cs_sampler, get_stsl_sampler
-from tmpd.plot import plot_single_image, plot_image
+from tmpd.samplers import get_cs_sampler
 import numpy as np
 import logging
 import ot
 from scipy.stats import wasserstein_distance
-import time
+# import time
 
 
 FLAGS = flags.FLAGS
 config_flags.DEFINE_config_file(
   "config", "./configs/rayleigh.py", "Training configuration.", lock_config=True)
-flags.DEFINE_string("workdir", "./workdir", "Work directory.")
-flags.mark_flags_as_required(["workdir", "config"])
+flags.mark_flags_as_required(["config"])
 logger = logging.getLogger(__name__)
 
 
@@ -48,14 +39,13 @@ def ot_sliced_wasserstein(seed, dist_1, dist_2, n_slices=100):
 
 
 def main(argv):
-  workdir = FLAGS.workdir
   config = FLAGS.config
   jax.default_device = jax.devices()[0]
   # Tip: use CUDA_VISIBLE_DEVICES to restrict the devices visible to jax
   # ... they must be all the same model of device for pmap to work
   num_devices =  int(jax.local_device_count()) if config.training.pmap else 1
-  color_posterior = '#a2c4c9'
-  color_algorithm = '#ff7878'
+  # color_posterior = '#a2c4c9'
+  # color_algorithm = '#ff7878'
 
   # Setup SDE
   if config.training.sde.lower()=='vpsde':
@@ -167,42 +157,42 @@ def main(argv):
     None,  # dataset.get_data_inverse_scaler(config),
     y, H, observation_map, adjoint_observation_map,
     stack_samples=config.sampling.stack_samples)
-  time_prev = time.time()
+  # time_prev = time.time()
   samples, _ = sampler(sample_rng)
-  sample_time = time.time() - time_prev
+  # sample_time = time.time() - time_prev
   print(samples.shape)
   plot_heatmap(samples=samples[:, [0, 1]], area_bounds=[-3., 3.], fname="diffusion_posterior_heatmap")
-  assert 0
+  # assert 0
 
-  # Sample true posterior using rayleigh
-  # Compare using Wasserstein
-  sliced_wasserstein_distance = sliced_wasserstein(dist_1=np.array(posterior_samples), dist_2=np.array(samples), n_slices=10000)
-  ot_sliced_wasserstein_distance = ot_sliced_wasserstein(seed=seed_num_inv_problem, dist_1=np.array(posterior_samples), dist_2=np.array(samples), n_slices=10000)
-  print("sample_time: {}, {}".format(sample_time, config.sampling.cs_method), sliced_wasserstein_distance, ot_sliced_wasserstein_distance)
-  dists_infos.append({"seed": seed_num_inv_problem,
-                      "dim": config.data.image_size,
-                      "dim_y": dim_y,
-                      "noise_std": config.sampling.noise_std,
-                      "num_steps": config.solver.num_outer_steps,
-                      "algorithm": config.sampling.cs_method,
-                      "distance_name": 'sw',
-                      "distance": sliced_wasserstein_distance,
-                      "ot_distance": ot_sliced_wasserstein_distance
-                      })
-  plot_image(config.sampling.noise_std, dim, dim_y, 1000, i, cs_method, [0, 1], samples, posterior_samples)
+  # # Sample true posterior using rayleigh
+  # # Compare using Wasserstein
+  # sliced_wasserstein_distance = sliced_wasserstein(dist_1=np.array(posterior_samples), dist_2=np.array(samples), n_slices=10000)
+  # ot_sliced_wasserstein_distance = ot_sliced_wasserstein(seed=seed_num_inv_problem, dist_1=np.array(posterior_samples), dist_2=np.array(samples), n_slices=10000)
+  # print("sample_time: {}, {}".format(sample_time, config.sampling.cs_method), sliced_wasserstein_distance, ot_sliced_wasserstein_distance)
+  # dists_infos.append({"seed": seed_num_inv_problem,
+  #                     "dim": config.data.image_size,
+  #                     "dim_y": dim_y,
+  #                     "noise_std": config.sampling.noise_std,
+  #                     "num_steps": config.solver.num_outer_steps,
+  #                     "algorithm": config.sampling.cs_method,
+  #                     "distance_name": 'sw',
+  #                     "distance": sliced_wasserstein_distance,
+  #                     "ot_distance": ot_sliced_wasserstein_distance
+  #                     })
+  # plot_image(config.sampling.noise_std, dim, dim_y, 1000, i, cs_method, [0, 1], samples, posterior_samples)
 
-  pd.DataFrame.from_records(dists_infos).to_csv(workdir + '/{}_{}_gmm_inverse_problem_comparison.csv'.format(config.sampling.cs_method, config.sampling.noise_std), float_format='%.3f')
+  # pd.DataFrame.from_records(dists_infos).to_csv(workdir + '/{}_{}_gmm_inverse_problem_comparison.csv'.format(config.sampling.cs_method, config.sampling.noise_std), float_format='%.3f')
 
-  data = pd.read_csv(workdir + '/{}_{}_gmm_inverse_problem_comparison.csv'.format(config.sampling.cs_method, config.sampling.noise_std))
-  agg_data = data.groupby(['dim', 'dim_y', 'num_steps', 'algorithm', 'distance_name']).distance.apply(lambda x: f'{np.nanmean(x):.1f} ± {1.96 * np.nanstd(x) / (x.shape[0]**.5):.1f}').reset_index()
+  # data = pd.read_csv(workdir + '/{}_{}_gmm_inverse_problem_comparison.csv'.format(config.sampling.cs_method, config.sampling.noise_std))
+  # agg_data = data.groupby(['dim', 'dim_y', 'num_steps', 'algorithm', 'distance_name']).distance.apply(lambda x: f'{np.nanmean(x):.1f} ± {1.96 * np.nanstd(x) / (x.shape[0]**.5):.1f}').reset_index()
 
-  agg_data_sw = agg_data.loc[agg_data.distance_name == 'sw'].pivot(index=('dim', 'dim_y', 'num_steps'), columns='algorithm', values=['distance']).reset_index()
-  agg_data_sw.columns = [col[-1].replace(' ', '_') if col[-1] else col[0].replace(' ', '_') for col in agg_data_sw.columns.values]
+  # agg_data_sw = agg_data.loc[agg_data.distance_name == 'sw'].pivot(index=('dim', 'dim_y', 'num_steps'), columns='algorithm', values=['distance']).reset_index()
+  # agg_data_sw.columns = [col[-1].replace(' ', '_') if col[-1] else col[0].replace(' ', '_') for col in agg_data_sw.columns.values]
 
-  for col in agg_data_sw.columns:
-    if col not in ['dim', 'dim_y', 'num_steps']:
-      agg_data_sw[col + '_num'] = agg_data_sw[col].apply(lambda x: float(x.split(" ± ")[0]))
-  agg_data_sw.loc[agg_data_sw.num_steps == 1000].to_csv(workdir + '/{}_{}_gmm_inverse_problem_aggregated_sliced_wasserstein_1000_steps.csv'.format(config.sampling.cs_method, config.sampling.noise_std))
+  # for col in agg_data_sw.columns:
+  #   if col not in ['dim', 'dim_y', 'num_steps']:
+  #     agg_data_sw[col + '_num'] = agg_data_sw[col].apply(lambda x: float(x.split(" ± ")[0]))
+  # agg_data_sw.loc[agg_data_sw.num_steps == 1000].to_csv(workdir + '/{}_{}_gmm_inverse_problem_aggregated_sliced_wasserstein_1000_steps.csv'.format(config.sampling.cs_method, config.sampling.noise_std))
 
 
 if __name__ == "__main__":
