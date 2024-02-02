@@ -285,7 +285,7 @@ class PiGDMVPplus(PiGDMVP):
 
 class ReproducePiGDMVP(DDIMVP):
   """
-  NOTE: We found this method to be unstable on all datasets, unless static
+  NOTE: We found this method to be unstable on all datasets, even when static
     thresholding (clip=True) is used at each step of estimating x_0.
   PiGDM Song et al. 2023. Markov chain using the DDIM Markov Chain or VP SDE."""
   def __init__(self, y, observation_map, noise_std, shape, model, eta=0.0, beta=None, ts=None):

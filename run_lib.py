@@ -110,6 +110,7 @@ def torch_lpips(loss_fn_vgg, x, samples):
   label = x.transpose(axes)
   delta = torch.from_numpy(np.array(delta))
   label = torch.from_numpy(np.array(label))
+  # Rescale to [-1., 1.]
   delta = delta * 2. - 1.
   label = label * 2. - 1.
   lpips = loss_fn_vgg(delta, label)
@@ -586,7 +587,7 @@ def plot(train_data, mean, std, xlabel='x', ylabel='y',
 def compute_metrics_inner(config, cs_method, eval_path, x, y, q_samples,
                           data_pools, inception_model,
                           compute_lpips=True, save=True):
-  samples = np.clip(q_samples * 255., 0, 255).astype(np.uint8)
+  uint8_samples = np.clip(q_samples * 255., 0, 255).astype(np.uint8)
   # Use inceptionV3 for images with resolution higher than 256.
   inceptionv3 = config.data.image_size >= 256
   # LPIPS - Need to permute and rescale to calculate correctly
@@ -594,7 +595,7 @@ def compute_metrics_inner(config, cs_method, eval_path, x, y, q_samples,
   # Evaluate FID scores
   # Force garbage collection before calling TensorFlow code for Inception network
   gc.collect()
-  latents = run_inception_distributed(samples, inception_model, inceptionv3=inceptionv3)
+  latents = run_inception_distributed(uint8_samples, inception_model, inceptionv3=inceptionv3)
   # Force garbage collection again before returning to JAX code
   gc.collect()
   # Save latent represents of the Inception network to disk
