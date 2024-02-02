@@ -29,7 +29,7 @@ setup(
     install_requires=[
         'ml-collections==0.1.1',
         'tensorflow-gan==2.0.0',
-        'tensorflow-io==0.32.0',
+        # 'tensorflow-io==0.32.0',
         'tensorflow_datasets==4.3.0',
         'tensorflow-probability==0.15.0',
         'tensorboard==2.7.0',

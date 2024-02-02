@@ -44,6 +44,8 @@ def load_dataset_stats(config):
   """Load the pre-computed dataset statistics."""
   if config.data.dataset == 'CIFAR10':
     filename = 'assets/cifar10_stats.npz'
+  elif config.data.dataset == 'FFHQ':
+    return None
   else:
     raise ValueError(f'Dataset {config.data.dataset} stats not found.')
 

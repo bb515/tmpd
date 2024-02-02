@@ -24,7 +24,7 @@ def get_config():
 
     # eval
     eval = config.eval
-    eval.batch_size = 1000
+    eval.batch_size = 3
 
     # sampling
     sampling = config.sampling
@@ -33,7 +33,7 @@ def get_config():
     sampling.denoise = True  # work out what denoise_override is
     sampling.innovation = True  # this will probably be superceded
     sampling.inverse_scaler = None
-    sampling.stack_samples = False
+    sampling.stack_samples = True
 
     # data
     data = config.data
@@ -57,8 +57,6 @@ def get_config():
     solver.eta = 1.0
     # solver.outer_solver = 'SMLD'
     solver.inner_solver = None
-    solver.stsl_scale_hyperparameter = 0.02
-    solver.dps_scale_hyperparameter = 0.05
 
     # optim
     optim = config.optim
