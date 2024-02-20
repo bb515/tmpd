@@ -163,7 +163,7 @@ class KGDMVPplus(KGDMVP):
   def analysis(self, y, x, t, timestep, ratio):
     h_x_0, vjp_h_x_0, (epsilon, _) = vjp(
         lambda x: self.estimate_h_x_0_vmap(x, t, timestep), x, has_aux=True)
-    C_yy = ratio * self.observation_map(vjp_h_x_0(self.observation_map(jnp.ones_like(x)))[0]) + self.noise_std**2
+    C_yy = self.observation_map(vjp_h_x_0(self.observation_map(jnp.ones_like(x)))[0]) + self.noise_std**2 / ratio
     ls = vjp_h_x_0((y - h_x_0) / C_yy)[0]
     return epsilon.squeeze(axis=0), ls
 
@@ -213,7 +213,7 @@ class KGDMVEplus(KGDMVE):
   def analysis(self, y, x, t, timestep, ratio):
     h_x_0, vjp_h_x_0, (epsilon, _) = vjp(
         lambda x: self.estimate_h_x_0_vmap(x, t, timestep), x, has_aux=True)
-    C_yy = ratio * self.observation_map(vjp_h_x_0(self.observation_map(jnp.ones_like(x)))[0]) + self.noise_std**2
+    C_yy = self.observation_map(vjp_h_x_0(self.observation_map(jnp.ones_like(x)))[0]) + self.noise_std**2 / ratio
     ls = vjp_h_x_0((y - h_x_0) / C_yy)[0]
     return epsilon.squeeze(axis=0), ls
 
@@ -259,16 +259,7 @@ class PiGDMVP(DDIMVP):
     return x_mean, std
 
 
-class PiGDMVPplus(PiGDMVP):
-  """PiGDMVP with a mask."""
-  def analysis(self, y, x, t, timestep, v, alpha):
-    h_x_0, vjp_estimate_h_x_0, (epsilon, _) = vjp(
-      lambda x: self.estimate_h_x_0_vmap(x, t, timestep), x, has_aux=True)
-    # Value suggested for VPSDE in original PiGDM paper
-    r = v * self.data_variance  / (v + alpha * self.data_variance)
-    C_yy = 1. + self.noise_std**2 / r
-    ls = vjp_estimate_h_x_0((y - h_x_0) / C_yy)[0]
-    return epsilon.squeeze(axis=0), ls
+PiGDMVPplus = PiGDMVP
 
 
 class ReproducePiGDMVP(DDIMVP):
@@ -315,24 +306,6 @@ class ReproducePiGDMVP(DDIMVP):
     return x_mean, std
 
 
-class ReproducePiGDMVPplus(ReproducePiGDMVP):
-  """
-  NOTE: We found this method to be unstable on CIFAR10 dataset, even with
-    thresholding (clip=True) is used at each step of estimating x_0, and for each weighting
-    schedule that we tried.
-  PiGDM with a mask. Song et al. 2023. Markov chain using the DDIM Markov Chain or VP SDE."""
-  def analysis(self, y, x, t, timestep, v, alpha):
-    h_x_0, vjp_estimate_h_x_0, (epsilon, x_0) = vjp(
-      lambda x: self.estimate_h_x_0_vmap(x, t, timestep), x, has_aux=True)
-    # Value suggested for VPSDE in original PiGDM paper:
-    r = v * self.data_variance  / (v + self.data_variance)
-    # What it should really be set to, following the authors' mathematical reasoning:
-    # r = v * self.data_variance  / (v + alpha * self.data_variance)
-    C_yy = 1. + self.noise_std**2 / r
-    ls = vjp_estimate_h_x_0((y - h_x_0) / C_yy)[0]
-    return x_0.squeeze(axis=0), ls, epsilon.squeeze(axis=0)
-
-
 class PiGDMVE(DDIMVE):
   """PiGDMVE for the SMLD Markov Chain or VE SDE."""
   def __init__(self, y, observation_map, noise_std, shape, model, data_variance=1., eta=1., sigma=None, ts=None):
@@ -348,6 +321,7 @@ class PiGDMVE(DDIMVE):
   def analysis(self, y, x, t, timestep, v):
     h_x_0, vjp_h_x_0, (epsilon, x_0) = vjp(
         lambda x: self.estimate_h_x_0_vmap(x, t, timestep), x, has_aux=True)
+    # Value suggested for VPSDE in original PiGDM paper
     r = v * self.data_variance / (v + self.data_variance)
     C_yy = 1. + self.noise_std**2 / r
     ls = vjp_h_x_0((y - h_x_0) / C_yy)[0]
@@ -365,13 +339,84 @@ class PiGDMVE(DDIMVE):
     return x_mean, std
 
 
-class PiGDMVEplus(PiGDMVE):
-  """KGDMVE with a mask."""
+class AGDMVP(PiGDMVP):
+  """Analytic Guided Diffusion Model for VP SDE."""
+  def __init__(self, y, observation_map, noise_std, shape, model, recon_mse, sigma_threshold=.2, data_variance=1., eta=1., beta=None, ts=None):
+    super().__init__(y, observation_map, noise_std, shape, model, recon_mse, data_variance, eta, beta, ts)
+    self.recon_mse = recon_mse
+    self.sigma_threshold = sigma_threshold
+
+  def analysis(self, y, x, t, timestep, v, alpha):
+    h_x_0, vjp_estimate_h_x_0, (epsilon, _) = vjp(
+      lambda x: self.estimate_h_x_0_vmap(x, t, timestep), x, has_aux=True)
+    # Value suggested for VPSDE in original PiGDM paper
+    if self.sqrt_1m_alphas_cumprod < self.sigma_threshold:
+      r = v * self.data_variance  / (v + alpha * self.data_variance)
+    else:
+      r = self.recon_mse['mse_list'][timestep]
+    C_yy = 1. + self.noise_std**2 / r
+    ls = vjp_estimate_h_x_0((y - h_x_0) / C_yy)[0]
+    return epsilon.squeeze(axis=0), ls
+
+
+class AGDMVE(PiGDMVE):
+  """Analytic Guided Diffusion Model for VE SDE."""
+  def __init__(self, y, observation_map, noise_std, shape, model, recon_mse, sigma_threshold=.2, data_variance=1., eta=1., sigma=None, ts=None):
+    super().__init__(y, observation_map, noise_std, shape, model, data_variance, eta, sigma, ts)
+    self.recon_mse = recon_mse
+    self.sigma_threshold = sigma_threshold
+
   def analysis(self, y, x, t, timestep, v):
     h_x_0, vjp_h_x_0, (epsilon, x_0) = vjp(
       lambda x: self.estimate_h_x_0_vmap(x, t, timestep), x, has_aux=True)
     # Value suggested for VPSDE in original PiGDM paper
-    r = v * self.data_variance  / (v + self.data_variance)
+    if self.sqrt_1m_alphas_cumprod < self.sigma_threshold:
+      r = v * self.data_variance  / (v + self.data_variance)
+    else:
+      r = self.recon_mse['mse_list'][timestep]
+    C_yy = 1. + self.noise_std**2 / r
+    ls = vjp_h_x_0((y - h_x_0) / C_yy)[0]
+    return x_0.squeeze(axis=0), ls, epsilon.squeeze(axis=0)
+
+
+class MCGDMVP(PiGDMVP):
+  """Monte-Carlo Guided Diffusion Model for VP SDE."""
+  def __init__(self, y, observation_map, noise_std, shape, model, recon_mse, sigma_threshold=.2, data_variance=1., eta=1., beta=None, ts=None):
+    super().__init__(y, observation_map, noise_std, shape, model, recon_mse, data_variance, eta, beta, ts)
+    self.recon_mse = recon_mse
+    self.sigma_threshold = sigma_threshold
+
+  def analysis(self, y, x, t, timestep, v, alpha):
+    h_x_0, vjp_estimate_h_x_0, (epsilon, _) = vjp(
+      lambda x: self.estimate_h_x_0_vmap(x, t, timestep), x, has_aux=True)
+    # Value suggested for VPSDE in original PiGDM paper
+    if self.sqrt_1m_alphas_cumprod < self.sigma_threshold:
+      r = v * self.data_variance  / (v + alpha * self.data_variance)
+    else:
+      r = self.recon_mse['mse_list'][timestep]
+    C_yy = 1. + self.noise_std**2 / r
+    ls = vjp_estimate_h_x_0((y - h_x_0) / C_yy)[0]
+    return epsilon.squeeze(axis=0), ls
+
+
+class MCGDMVE(PiGDMVE):
+  """Monte-Carlo Guided Diffusion Model for VE SDE."""
+  def __init__(self, y, observation_map, noise_std, shape, model, recon_mse, sigma_threshold=.2, data_variance=1., eta=1., sigma=None, ts=None):
+    super().__init__(y, observation_map, noise_std, shape, model, data_variance, eta, sigma, ts)
+    self.recon_mse = recon_mse
+    self.sigma_threshold = sigma_threshold
+
+  def analysis(self, y, x, t, timestep, v):
+    h_x_0, vjp_h_x_0, (epsilon, x_0) = vjp(
+      lambda x: self.estimate_h_x_0_vmap(x, t, timestep), x, has_aux=True)
+    # Value suggested for VPSDE in original PiGDM paper
+    if self.sqrt_1m_alphas_cumprod < self.sigma_threshold:
+      r = v * self.data_variance  / (v + self.data_variance)
+    else:
+      r = self.recon_mse['mse_list'][timestep]
+
+    C_yy = jnp.linalg.norm(y - h_x_0, axis=0)**2
+
     C_yy = 1. + self.noise_std**2 / r
     ls = vjp_h_x_0((y - h_x_0) / C_yy)[0]
     return x_0.squeeze(axis=0), ls, epsilon.squeeze(axis=0)
@@ -427,9 +472,6 @@ class DPSSMLD(SMLD):
     return x, x_mean
 
 
-DPSSMLDplus = DPSSMLD
-
-
 class DPSDDPM(DDPM):
   """DPS for DDPM ancestral sampling.
     NOTE: This method requires static thresholding (clip=True) in order to remain
@@ -471,9 +513,6 @@ class DPSDDPM(DDPM):
     z = random.normal(rng, x.shape)
     x = x_mean + batch_mul(std, z)
     return x, x_mean
-
-
-DPSDDPMplus = DPSDDPM
 
 
 class KPDDPM(DDPM):

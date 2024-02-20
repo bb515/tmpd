@@ -50,10 +50,9 @@ logging.basicConfig(filename=str(float(time.time())) + ".log",
 mse_vmap = vmap(lambda a, b: jnp.mean((a - b)**2))
 flatten_vmap = vmap(lambda x: x.flatten())
 
-unconditional_ddim_methods = ['DDIMVE', 'DDIMVP', 'DDIMVEplus', 'DDIMVPplus']
-unconditional_markov_methods = ['DDIM', 'DDIMplus', 'SMLD', 'SMLDplus']
-ddim_methods = ['ReproducePiGDMVP', 'PiGDMVP', 'PiGDMVE', 'PiGDMVPplus', 'PiGDMVEplus',
-  'KGDMVP', 'KGDMVE', 'KGDMVPplus', 'KGDMVEplus']
+unconditional_ddim_methods = ['DDIMVE', 'DDIMVP']
+unconditional_markov_methods = ['DDIM', 'SMLD']
+ddim_methods = ['ReproducePiGDMVP', 'PiGDMVP', 'PiGDMVE', 'KGDMVP', 'KGDMVE', 'KGDMVPplus', 'KGDMVEplus']
 markov_methods = ['KPDDPM', 'KPDDPMplus', 'KPSMLD', 'KPSMLDplus']
 
 __DATASET__ = {}
@@ -61,22 +60,12 @@ __DATASET__ = {}
 
 def _dps_method(config):
   if config.training.sde.lower() == 'vpsde':
-    if 'plus' not in config.sampling.cs_method:
-      # VP/DDPM Methods with matrix H
-      # cs_method = 'chung2022scalar'
-      cs_method = 'DPSDDPM'
-    else:
-      # VP/DDM methods with mask
-      # cs_method = 'chung2022scalarplus'
-      cs_method = 'DPSDDPMplus'
+    # VP/DDPM Methods with observation map h
+    # cs_method = 'chung2022scalar'
+    cs_method = 'DPSDDPM'
   elif config.training.sde.lower() == 'vesde':
-    if 'plus' not in config.sampling.cs_method:
-      # VE/SMLD Methods with matrix H
-      # cs_method = 'chung2022scalar'
-      cs_method = 'DPSSMLD'
-    else:
-      # cs_method = 'chung2022scalarplus'
-      cs_method = 'DPSSMLDplus'
+    # cs_method = 'chung2022scalar'
+    cs_method = 'DPSSMLD'
   return [cs_method]
 
 
@@ -352,12 +341,12 @@ def get_sde(config):
       # VP/DDM methods with mask
       cs_methods = [
                     'KPDDPMplus',
-                    'DPSDDPMplus',
-                    # 'ReproducePiGDMVPplus',
-                    'PiGDMVPplus',
+                    'DPSDDPM',
+                    # 'ReproducePiGDMVP',
+                    'PiGDMVP',
                     'TMPD2023bvjpplus',
-                    'chung2022scalarplus',
-                    'Song2023plus',
+                    'chung2022scalar',
+                    'Song2023',
                     ]
   elif config.training.sde.lower() == 'vesde':
     sigma = get_sigma_function(sigma_min=config.model.sigma_min, sigma_max=config.model.sigma_max)
@@ -379,13 +368,13 @@ def get_sde(config):
       cs_methods = [
                     # 'KPSMLDdiag',
                     'KPSMLDplus',
-                    'DPSSMLDplus',
-                    'PiGDMVEplus',
+                    'DPSSMLD',
+                    'PiGDMVE',
                     # 'KGDMVEplus',
                     'TMPD2023bvjpplus',
-                    'chung2022scalarplus',  
-                    # 'chung2022plus',  
-                    'Song2023plus',
+                    'chung2022scalar',
+                    # 'chung2022',
+                    'Song2023',
                     ]
   else:
     raise NotImplementedError(f"SDE {config.training.sde} unknown.")
