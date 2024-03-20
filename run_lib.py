@@ -354,9 +354,9 @@ def get_sde(config):
                     'DPSDDPMplus',
                     # 'ReproducePiGDMVPplus',
                     'PiGDMVPplus',
-                    'TMPD2023bvjpplus',
-                    'chung2022scalarplus',
-                    'Song2023plus',
+                    # 'TMPD2023bvjpplus',
+                    # 'chung2022scalarplus',
+                    # 'Song2023plus',
                     ]
   elif config.training.sde.lower() == 'vesde':
     sigma = get_sigma_function(sigma_min=config.model.sigma_min, sigma_max=config.model.sigma_max)
@@ -381,10 +381,10 @@ def get_sde(config):
                     'DPSSMLDplus',
                     'PiGDMVEplus',
                     # 'KGDMVEplus',
-                    'TMPD2023bvjpplus',
-                    'chung2022scalarplus',  
+                    # 'TMPD2023bvjpplus',
+                    # 'chung2022scalarplus',  
                     # 'chung2022plus',  
-                    'Song2023plus',
+                    # 'Song2023plus',
                     ]
   else:
     raise NotImplementedError(f"SDE {config.training.sde} unknown.")
@@ -635,7 +635,7 @@ def compute_metrics_inner(config, cs_method, eval_path, x, y, q_samples,
 
   logging.info("tmp_pool_3.shape: {}".format(tmp_pool_3.shape))
   # must have rank 2 to calculate distribution distances
-  if tmp_pool_3.shape[0] > 1 and compute_lpips:
+  if tmp_pool_3.shape[0] > 1 and compute_lpips and (data_pools is not None):
     # Compute FID/KID/IS on individual inverse problem
     if not inceptionv3:
       _inception_score = tfgan.eval.classifier_score_from_logits(tmp_logits)
@@ -656,7 +656,6 @@ def compute_metrics_inner(config, cs_method, eval_path, x, y, q_samples,
       stable_kid = tfgan.eval.kernel_classifier_distance_from_activations(
         _tf_data_pools, stable_tf_tmp_pools).numpy()
       del _tf_data_pools, _tf_tmp_pools, stable_tf_tmp_pools
-    else: raise ValueError("data pools was None")
 
     logging.info("cs_method-{} - stable: {}, \
                   IS: {:6e}, FID: {:6e}, KID: {:6e}, \
@@ -680,6 +679,32 @@ def compute_metrics_inner(config, cs_method, eval_path, x, y, q_samples,
       mse=_mse,
       IS=_inception_score, fid=_fid, kid=_kid,
       stable_IS=stable_inception_score, stable_fid=stable_fid, stable_kid=stable_kid,
+      lpips_mean=lpips_mean, lpips_std=lpips_std,
+      psnr_mean=psnr_mean, psnr_std=psnr_std,
+      ssim_mean=ssim_mean, ssim_std=ssim_std,
+      mse_mean=mse_mean, mse_std=mse_std,
+      stable_lpips_mean=stable_lpips_mean, stable_lpips_std=stable_lpips_std,
+      stable_psnr=stable_psnr_mean, stable_psnr_std=stable_psnr_std,
+      stable_ssim=stable_ssim_mean, stable_ssim_std=stable_ssim_std,
+      stable_mse=stable_mse_mean, stable_mse_std=stable_mse_std
+      )
+  elif (data_pools is None) and compute_lpips:
+    logging.info("cs_method-{} - stable: {}, \
+                  LPIPS: {:6e}+/-{:3e}, PSNR: {:6e}+/-{:3e}, SSIM: {:6e}+/-{:3e}, MSE: {:6e}+/-{:3e}, \
+                  SLPIPS: {:6e}+/-{:3e}, SPSNR: {:6e}+/-{:3e}, SSSIM: {:6e}+/-{:3e}, SMSE: {:6e}+/-{:3e}".format(
+        cs_method, fraction_stable,
+        lpips_mean, lpips_std, psnr_mean, psnr_std, ssim_mean, ssim_std, mse_mean, mse_std,
+        stable_lpips_mean, stable_lpips_std, stable_psnr_mean, stable_psnr_std, stable_ssim_mean, stable_ssim_std, stable_mse_mean, stable_mse_std,
+        ))
+    if save: np.savez_compressed(
+      eval_path + "_stats.npz",
+      x=x, y=y,
+      samples=q_samples, noise_std=config.sampling.noise_std,
+      pool_3=tmp_pool_3, logits=tmp_logits,
+      lpips=_lpips,
+      psnr=_psnr,
+      ssim=_ssim,
+      mse=_mse,
       lpips_mean=lpips_mean, lpips_std=lpips_std,
       psnr_mean=psnr_mean, psnr_std=psnr_std,
       ssim_mean=ssim_mean, ssim_std=ssim_std,
@@ -716,12 +741,13 @@ def compute_metrics_inner(config, cs_method, eval_path, x, y, q_samples,
   return (psnr_mean, psnr_std), (lpips_mean, lpips_std), (mse_mean, mse_std), (ssim_mean, ssim_std)
 
 
-def compute_metrics(config, cs_methods, eval_folder):
+def compute_metrics(config, cs_methods, eval_folder, data_pools=True, compute_lpips=True):
   # Use inceptionV3 for images with resolution higher than 256.
   inceptionv3 = config.data.image_size >= 256
   # Load pre-computed dataset statistics.
-  data_stats = load_dataset_stats(config)
-  data_pools = data_stats["pool_3"]
+  if data_pools:
+    data_stats = load_dataset_stats(config)
+    data_pools = data_stats["pool_3"]
   for cs_method in cs_methods:
     config.sampling.cs_method = cs_method
     # eval_file = "{}_{}_eval_{}".format(
@@ -738,6 +764,7 @@ def compute_metrics(config, cs_methods, eval_folder):
     all_mse = []
     stats = tf.io.gfile.glob(os.path.join(eval_folder, eval_file + "_*_stats.npz"))
     flag = 1
+    print(flag)
 
     logging.info("stats path: {}, length stats: {}".format(
       os.path.join(eval_folder, eval_file + "_*_stats.npz"), len(stats)))
@@ -745,53 +772,57 @@ def compute_metrics(config, cs_methods, eval_folder):
     for stat_file in stats:
       with tf.io.gfile.GFile(stat_file, "rb") as fin:
         stat = np.load(fin)
-        tmp_logits = stat["logits"]
-        tmp_pools = stat["pool_3"]
+        if data_pools:
+          tmp_logits = stat["logits"]
+          tmp_pools = stat["pool_3"]
         if flag:
           try:
-            tmp_lpips = stat["lpips"]
+            if compute_lpips:
+              tmp_lpips = stat["lpips"]
+              all_lpips.append(tmp_lpips)
             tmp_psnr = stat["psnr"]
             tmp_ssim = stat["ssim"]
             tmp_mse = stat["mse"]
-            all_lpips.append(tmp_lpips)
             all_psnr.append(tmp_psnr)
             all_mse.append(tmp_mse)
             all_ssim.append(tmp_ssim)
           except:
             logging.info("Did not compute distance metrics")
             flag = 0
+        if data_pools:
+          if not inceptionv3:
+            logging.info("tmpd_logits.shape: {}, len(all_logits): {}".format(
+              tmp_logits.shape, len(all_logits)))
+            all_logits.append(tmp_logits)
+          all_pools.append(tmp_pools)
 
-        if not inceptionv3:
-          logging.info("tmpd_logits.shape: {}, len(all_logits): {}".format(
-            tmp_logits.shape, len(all_logits)))
-          all_logits.append(tmp_logits)
-        all_pools.append(tmp_pools)
+    if data_pools:
+      if not inceptionv3:
+        if len(all_logits) != 1:
+          all_logits = np.concatenate(all_logits, axis=0)
+        else:
+          all_logits = np.array(all_logits[0])
 
-    if not inceptionv3:
-      if len(all_logits) != 1:
-        all_logits = np.concatenate(all_logits, axis=0)
-      else:
-        all_logits = np.array(all_logits[0])
-
-    if len(all_pools) != 1:
-      all_pools = np.concatenate(all_pools, axis=0)
+    if len(all_mse) != 1:
+      if data_pools: all_pools = np.concatenate(all_pools, axis=0)
       if flag:
-        all_lpips = np.concatenate(all_lpips, axis=0)
+        if compute_lpips: all_lpips = np.concatenate(all_lpips, axis=0)
         all_psnr = np.concatenate(all_psnr, axis=0)
         all_ssim = np.concatenate(all_ssim, axis=0)
         all_mse = np.concatenate(all_mse, axis=0)
     else:
-      all_pools = np.array(all_pools[0])
+      if data_pools: all_pools = np.array(all_pools[0])
       if flag:
-        all_lpips = np.array(all_lpips[0])
+        if compute_lpips: all_lpips = np.array(all_lpips[0])
         all_psnr = np.array(all_psnr[0])
         all_ssim = np.array(all_ssim[0])
         all_mse = np.array(all_mse[0])
 
-    logging.info("logits shape: {}".format(all_logits.shape))
+    if data_pools: logging.info("logits shape: {}".format(all_logits.shape))
     if flag:
-      lpips_mean = np.mean(all_lpips)
-      lpips_std = np.std(all_lpips)
+      if compute_lpips:
+        lpips_mean = np.mean(all_lpips)
+        lpips_std = np.std(all_lpips)
       psnr_mean = np.mean(all_psnr)
       psnr_std = np.std(all_psnr)
       ssim_mean = np.mean(all_ssim)
@@ -802,12 +833,13 @@ def compute_metrics(config, cs_methods, eval_folder):
       # within a theoretical limit (image has support [0., 1.] so max mse is 1.0)
       idx = np.argwhere(all_mse < 1.0).flatten()  # mse is scalar, so flatten is okay
       fraction_stable = len(idx) / jnp.shape(all_mse)[0]
-      all_stable_lpips = all_lpips[idx]
+      if compute_lpips: all_stable_lpips = all_lpips[idx]
       all_stable_mse = all_mse[idx]
       all_stable_ssim = all_ssim[idx]
       all_stable_psnr = all_psnr[idx]
-      stable_lpips_mean = np.mean(all_stable_lpips)
-      stable_lpips_std = np.std(all_stable_lpips)
+      if compute_lpips:
+        stable_lpips_mean = np.mean(all_stable_lpips)
+        stable_lpips_std = np.std(all_stable_lpips)
       stable_psnr_mean = np.mean(all_stable_psnr)
       stable_psnr_std = np.std(all_stable_psnr)
       stable_ssim_mean = np.mean(all_stable_ssim)
@@ -816,29 +848,49 @@ def compute_metrics(config, cs_methods, eval_folder):
       stable_mse_std = np.std(all_stable_mse)
 
     # Compute FID/KID/IS on all samples together.
-    if not inceptionv3:
-      inception_score = tfgan.eval.classifier_score_from_logits(all_logits)
-      if flag: stable_inception_score = tfgan.eval.classifier_score_from_logits(all_logits[idx])
-    else:
-      inception_score = -1
-      if flag: stable_inception_score = -1
+    if data_pools:
+      if not inceptionv3:
+        inception_score = tfgan.eval.classifier_score_from_logits(all_logits)
+        if flag: stable_inception_score = tfgan.eval.classifier_score_from_logits(all_logits[idx])
+      else:
+        inception_score = -1
+        if flag: stable_inception_score = -1
 
-    fid = tfgan.eval.frechet_classifier_distance_from_activations(
-      data_pools, all_pools)
-    if flag: stable_fid = tfgan.eval.frechet_classifier_distance_from_activations(
-      data_pools, all_pools[idx])
-    # Hack to get tfgan KID work for eager execution.
-    tf_data_pools = tf.convert_to_tensor(data_pools)
-    tf_all_pools = tf.convert_to_tensor(all_pools)
-    if flag: tf_all_stable_pools = tf.convert_to_tensor(all_pools[idx])
-    kid = tfgan.eval.kernel_classifier_distance_from_activations(
-      tf_data_pools, tf_all_pools).numpy()
-    if flag: stable_kid = tfgan.eval.kernel_classifier_distance_from_activations(
-      tf_data_pools, tf_all_stable_pools).numpy()
-    del tf_data_pools, tf_all_pools
-    if flag: del tf_all_stable_pools
+      fid = tfgan.eval.frechet_classifier_distance_from_activations(
+        data_pools, all_pools)
+      if flag: stable_fid = tfgan.eval.frechet_classifier_distance_from_activations(
+        data_pools, all_pools[idx])
+      # Hack to get tfgan KID work for eager execution.
+      tf_data_pools = tf.convert_to_tensor(data_pools)
+      tf_all_pools = tf.convert_to_tensor(all_pools)
+      if flag: tf_all_stable_pools = tf.convert_to_tensor(all_pools[idx])
+      kid = tfgan.eval.kernel_classifier_distance_from_activations(
+        tf_data_pools, tf_all_pools).numpy()
+      if flag: stable_kid = tfgan.eval.kernel_classifier_distance_from_activations(
+        tf_data_pools, tf_all_stable_pools).numpy()
+      del tf_data_pools, tf_all_pools
+      if flag: del tf_all_stable_pools
 
-    if flag:
+    if (data_pools is None) and compute_lpips:
+      logging.info("cs_method-{} - stable: {}, \
+                   LPIPS: {:6e}+/-{:3e}, PSNR: {:6e}+/-{:3e}, SSIM: {:6e}+/-{:3e}, MSE: {:6e}+/-{:3e}, \
+                   SLPIPS: {:6e}+/-{:3e}, SPSNR: {:6e}+/-{:3e}, SSSIM: {:6e}+/-{:3e}, SMSE: {:6e}+/-{:3e}".format(
+          cs_method, fraction_stable,
+          lpips_mean, lpips_std, psnr_mean, psnr_std, ssim_mean, ssim_std, mse_mean, mse_std,
+          stable_lpips_mean, stable_lpips_std, stable_psnr_mean, stable_psnr_std, stable_ssim_mean, stable_ssim_std, stable_mse_mean, stable_mse_std,
+          ))
+      np.savez_compressed(
+        eval_file + "_reports.npz",
+        lpips_mean=lpips_mean, lpips_std=lpips_std,
+        psnr_mean=psnr_mean, psnr_std=psnr_std,
+        ssim_mean=ssim_mean, ssim_std=ssim_std,
+        mse_mean=mse_mean, mse_std=mse_std,
+        stable_lpips_mean=stable_lpips_mean, stable_lpips_std=stable_lpips_std,
+        stable_psnr=stable_psnr_mean, stable_psnr_std=stable_psnr_std,
+        stable_ssim=stable_ssim_mean, stable_ssim_std=stable_ssim_std,
+        stable_mse=stable_mse_mean, stable_mse_std=stable_mse_std
+        )
+    elif flag:
       logging.info("cs_method-{} - stable: {}, \
                    IS: {:6e}, FID: {:6e}, KID: {:6e}, \
                    SIS: {:6e}, SFID: {:6e}, SKID: {:6e}, \
@@ -1325,6 +1377,7 @@ def evaluate_super_resolution(config,
   eval_iter = iter(eval_ds)
   # TODO: can tree_map be used to pmap across observation data?
   for i, batch in enumerate(eval_iter):
+    if i <= 68: continue  # due to OOM error on first run
     if i == num_eval//config.eval.batch_size: break  # Only evaluate on first num_eval samples
     eval_batch = jax.tree_map(lambda x: scaler(x._numpy()), batch)  # pylint: disable=protected-access
     x = eval_batch['image'][0]
@@ -1357,7 +1410,9 @@ def evaluate_super_resolution(config,
 
 def evaluate_from_file(config, workdir, eval_folder="eval"):
   cs_methods, _ = get_sde(config)
-  compute_metrics(config, cs_methods, eval_folder)
+  # TODO: tmp eval for FFHQ which does not evaluate data_pools
+  compute_metrics(config, cs_methods, eval_folder, data_pools=None, compute_lpips=True)
+  # compute_metrics(config, cs_methods, eval_folder)
 
 
 def revaluate_from_file(config, workdir, eval_folder="eval"):
