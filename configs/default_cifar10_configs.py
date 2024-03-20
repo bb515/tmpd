@@ -25,6 +25,7 @@ def get_default_configs():
   sampling.noise_removal = True
   sampling.probability_flow = False
   sampling.snr = 0.16
+  sampling.store_H = False
 
   # evaluation
   config.eval = evaluate = ml_collections.ConfigDict()

@@ -153,6 +153,83 @@ class FFHQDataset(VisionDataset):
         return img
 
 
+def reconstruction_mean_squared_error(config, workdir, eval_folder="eval"):
+  """ Compute the Monte-Carlo estimate of the reconstruction error given the pretrained conditional model.
+  TODO: this assume that forward and backwards process have same marginals. Is this a limitation?
+
+  Args:
+    config: Configuration to use.
+    workdir: Working directory for checkpoints.
+    eval_folder: The subfolder for storing evaluation results. Default to
+      "eval".
+  """
+  (num_devices, cs_methods, sde, inverse_scaler, scaler, epsilon_fn, score_fn, sampling_shape, rng
+    ) = _setup(config, workdir, eval_folder)
+
+  num_epochs = config.training.n_iters
+  num_steps = config.model.num_scales
+  num_batch = config.training.batch_size
+
+  def mc_recon_mse(rng, batch):
+    """Compute reconstruction error."""
+    prod_data_shape = jnp.prod(data.shape)
+    m = sde.mean_coeff(t)
+    mean = batch_mul(m, data)
+    v = sde.variance(t)
+    std = jnp.sqrt(v)
+    rng, step_rng = random.split(rng)
+    noise = random.normal(step_rng, data.shape)
+    x = mean + batch_mul(std, noise)
+    errors = std * noise + batch_mul(score(x, t), v)
+    return jnp.linalg.norm(errors) / prod_data_shape
+
+  @jit
+  def step_fn(carry, batch):
+    rng = carry
+    rng, step_rng = random.split(rng)
+    loss_val = mc_recon_mse(rng, batch)
+    if config.training.pmap: loss_val = jax.lax.pmean(loss_val, axis_name='batch')
+    return rng, loss_val
+
+  if config.training.n_jitted_steps > 1:
+    step_fn = jax.pmap(step_fn, axis_name='batch', donate_argnums=1)
+
+  mse_list = np.zeros(num_steps)
+  sigmas = np.zeros(num_steps)
+
+  for i in range(num_steps):
+    with tqdm(
+      train_dataloader,
+      unit=" batch",
+      disable=True
+    ) as tepoch:
+
+      tepoch.set_description(f"Epoch {i_epoch}")
+      losses = jnp.empty((len(tepoch), 1))
+      running_average = 0.
+      for i_batch, batch in enumerate(tepoch):
+        if i_batch == num_batches:
+          break
+        batch = jax.tree_map(lambda x: scaler(x), batch)
+
+        # Execute one training step
+        if config.training.pmap:
+          rng, *next_rng = jax.random.split(rng, num=jax.local_device_count() + 1)
+          next_rng = jnp.asarray(next_rng)  # type: ignore
+        else:
+          rng, next_rng = jax.random.split(rng, num=2)  # type: ignore
+
+        (_, sigma) , loss_train = step_fn((next_rng, state.params, state.opt_state), batch)
+        running_average += loss_train
+
+      r = running_average / (num_batch * num_batches)
+    mse_list[i] = r
+    sigmas[i] = sigma
+
+  np.savez(eval_folder + "", mse_list=mse_list, sigmas=sigmas)
+  return recon_mse, sigmas
+
+
 def _sample(i, config, eval_folder, cs_methods, sde, epsilon_fn, score_fn, sampling_shape,
             inverse_scaler, y, H, observation_map, adjoint_observation_map, rng,
             compute_metrics=False, search=False):
@@ -327,7 +404,7 @@ def get_sde(config):
   if config.training.sde.lower() == 'vpsde':
     beta, log_mean_coeff = get_linear_beta_function(beta_min=config.model.beta_min, beta_max=config.model.beta_max)
     sde = VP(beta, log_mean_coeff)
-    if 'plus' not in config.sampling.cs_method:
+    if config.sampling.store_H:
       # VP/DDPM Methods with matrix H
       cs_methods = [
                     'KPDDPM',
@@ -351,7 +428,7 @@ def get_sde(config):
   elif config.training.sde.lower() == 'vesde':
     sigma = get_sigma_function(sigma_min=config.model.sigma_min, sigma_max=config.model.sigma_max)
     sde = VE(sigma)
-    if 'plus' not in config.sampling.cs_method:
+    if config.sampling.store_H:
       # VE/SMLD Methods with matrix H
       cs_methods = [
                     # 'TMPD2023bvjp'
@@ -880,8 +957,6 @@ def compute_metrics(config, cs_methods, eval_folder):
   # assert 0
 
   # for i in range(num_sampling_rounds):
-
-
   #   print(observation_map)
   #   assert 0
   #   adjoint_observation_map = None
@@ -1048,7 +1123,7 @@ def jpeg(config, workdir, eval_folder="eval"):
 
     _plot_ground_observed(x.copy(), y.copy(), x.shape, eval_folder, inverse_scaler, config, i)
 
-    if 'plus' not in config.sampling.cs_method:
+    if config.sampling.store_H:
       raise ValueError("Nonlinear observation map is not compatible.")
     else:
       def observation_map(x):
@@ -1086,7 +1161,7 @@ def colorization(config, workdir, eval_folder="eval"):
 
     _plot_ground_observed(x.copy(), y.copy(), x.shape, eval_folder, inverse_scaler, config, i)
 
-    if 'plus' not in config.sampling.cs_method:
+    if config.sampling.store_H:
       raise NotImplementedError
     else:
       def observation_map(x):
@@ -1121,9 +1196,9 @@ def inpainting(config, workdir, eval_folder="eval"):
 
     _plot_ground_observed(x.copy(), y.copy(), x.shape, eval_folder, inverse_scaler, config, i)
 
-    if 'plus' not in config.sampling.cs_method:
+    if config.sampling.store_H:
       logging.warning(
-        "Using full H matrix H.shape={} which may be too large to fit in memory ".format(
+        "Using method that stores full H matrix H.shape={} which may be too large to fit in memory ".format(
           (num_obs, config.data.image_size**2 * config.data.num_channels)))
       idx_obs = np.nonzero(mask)[0]
       H = jnp.zeros((num_obs, config.data.image_size**2 * config.data.num_channels))
@@ -1213,9 +1288,7 @@ def sample(config,
     fname="{} samples".format(config.data.dataset))
 
 
-def evaluate_inpainting(config,
-             workdir,
-             eval_folder="eval"):
+def evaluate_inpainting(config, workdir, eval_folder="eval"):
   """Evaluate trained models.
 
   Args:
@@ -1248,9 +1321,9 @@ def evaluate_inpainting(config,
 
     _plot_ground_observed(x.copy(), y.copy(), x.shape, eval_folder, inverse_scaler, config, i)
 
-    if 'plus' not in config.sampling.cs_method:
+    if config.sampling.store_H:
       logging.warning(
-        "Using full H matrix H.shape={} which may be too large to fit in memory ".format(
+        "Using method that stores full H matrix H.shape={} which may be too large to fit in memory ".format(
           (num_obs, config.data.image_size**2 * config.data.num_channels)))
       idx_obs = np.nonzero(mask)[0]
       H = jnp.zeros((num_obs, config.data.image_size**2 * config.data.num_channels))
@@ -1432,9 +1505,9 @@ def dps_search_inpainting(
     scale = float(f'{float(f"{scale:.3g}"):g}')
     config.solver.dps_scale_hyperparameter = scale
 
-    if 'plus' not in config.sampling.cs_method and mask:
+    if config.sampling.store_H and mask:
       logging.warning(
-        "Using full H matrix H.shape={} which may be too large to fit in memory ".format(
+        "Using method that stores full H matrix H.shape={} which may be too large to fit in memory ".format(
           (num_obs, config.data.image_size**2 * config.data.num_channels)))
       idx_obs = np.nonzero(mask)[0]
       H = jnp.zeros((num_obs, config.data.image_size**2 * config.data.num_channels))
