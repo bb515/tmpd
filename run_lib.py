@@ -594,13 +594,14 @@ def compute_metrics_inner(config, cs_method, eval_path, x, y, q_samples,
   if compute_lpips: loss_fn_vgg = lpips.LPIPS(net='vgg')
   # Evaluate FID scores
   # Force garbage collection before calling TensorFlow code for Inception network
-  gc.collect()
-  latents = run_inception_distributed(samples, inception_model, inceptionv3=inceptionv3)
-  # Force garbage collection again before returning to JAX code
-  gc.collect()
-  # Save latent represents of the Inception network to disk
-  tmp_logits = latents["logits"].numpy()
-  tmp_pool_3 = latents["pool_3"].numpy()
+  if data_pools is not None:
+    gc.collect()
+    latents = run_inception_distributed(samples, inception_model, inceptionv3=inceptionv3)
+    # Force garbage collection again before returning to JAX code
+    gc.collect()
+    # Save latent represents of the Inception network to disk
+    tmp_logits = latents["logits"].numpy()
+    tmp_pool_3 = latents["pool_3"].numpy()
 
   # Compute PSNR, SSIM, MSE, LPIPS across images, and save them in stats files
   if compute_lpips:
@@ -633,9 +634,9 @@ def compute_metrics_inner(config, cs_method, eval_path, x, y, q_samples,
   stable_mse_mean = np.mean(all_stable_mse)
   stable_mse_std = np.std(all_stable_mse)
 
-  logging.info("tmp_pool_3.shape: {}".format(tmp_pool_3.shape))
   # must have rank 2 to calculate distribution distances
-  if tmp_pool_3.shape[0] > 1 and compute_lpips and (data_pools is not None):
+  if compute_lpips and (data_pools is not None):
+    logging.info("tmp_pool_3.shape: {}".format(tmp_pool_3.shape))
     # Compute FID/KID/IS on individual inverse problem
     if not inceptionv3:
       _inception_score = tfgan.eval.classifier_score_from_logits(tmp_logits)
@@ -700,7 +701,6 @@ def compute_metrics_inner(config, cs_method, eval_path, x, y, q_samples,
       eval_path + "_stats.npz",
       x=x, y=y,
       samples=q_samples, noise_std=config.sampling.noise_std,
-      pool_3=tmp_pool_3, logits=tmp_logits,
       lpips=_lpips,
       psnr=_psnr,
       ssim=_ssim,
@@ -1291,9 +1291,13 @@ def evaluate_inpainting(config,
   # Use inceptionV3 for images with resolution higher than 256.
   inceptionv3 = config.data.image_size >= 256
   inception_model = get_inception_model(inceptionv3=inceptionv3)
-  # Load pre-computed dataset statistics.
-  data_stats = load_dataset_stats(config)
-  data_pools = data_stats["pool_3"]
+
+  if config.data.dataset == 'FFHQ':
+    data_stats = None
+    data_pools = None
+  else:
+    data_stats = load_dataset_stats(config)
+    data_pools = data_stats["pool_3"]
 
   num_eval = 1000
   eval_ds = get_eval_dataset(scaler, config, num_devices)
@@ -1305,8 +1309,7 @@ def evaluate_inpainting(config,
     eval_batch = jax.tree_map(lambda x: scaler(x._numpy()), batch)  # pylint: disable=protected-access
     x = eval_batch['image'][0]
     # x = get_eval_sample(scaler, config, num_devices)
-    _, y, mask, num_obs = get_inpainting_observation(rng, x, config, mask_name='half')
-
+    _, y, mask, num_obs = get_inpainting_observation(rng, x, config, mask_name='square')
     _plot_ground_observed(x.copy(), y.copy(), x.shape, eval_folder, inverse_scaler, config, i)
 
     if 'plus' not in config.sampling.cs_method:
@@ -1336,7 +1339,7 @@ def evaluate_inpainting(config,
             compute_metrics=(x, data_pools, inception_model, inceptionv3))
     logging.info("samples: {}/{}".format(i * config.eval.batch_size, num_eval))
 
-  compute_metrics(config, cs_methods, eval_folder)
+  compute_metrics(config, cs_methods, eval_folder, data_pools=None, compute_lpips=True)
 
 
 def evaluate_super_resolution(config,
@@ -1377,7 +1380,9 @@ def evaluate_super_resolution(config,
   eval_iter = iter(eval_ds)
   # TODO: can tree_map be used to pmap across observation data?
   for i, batch in enumerate(eval_iter):
-    if i <= 68: continue  # due to OOM error on first run
+    if i <= 68:
+      print(i)
+      continue  # due to OOM error on first run
     if i == num_eval//config.eval.batch_size: break  # Only evaluate on first num_eval samples
     eval_batch = jax.tree_map(lambda x: scaler(x._numpy()), batch)  # pylint: disable=protected-access
     x = eval_batch['image'][0]
